@@ -24,7 +24,7 @@ jobs:
 
       - name: Read version from manifest
         id: version
-        run: echo "version=$(node -e \"console.log(require('./manifest.json').version)\")" >> $GITHUB_OUTPUT
+        run: echo "version=$(jq -r .version manifest.json)" >> $GITHUB_OUTPUT
 
       - name: Create or update release
         uses: softprops/action-gh-release@v2
