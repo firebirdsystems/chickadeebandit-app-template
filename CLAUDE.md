@@ -877,6 +877,57 @@ actual SQL rewriting — when in doubt, check
 `packages/hub/__tests__/unit/cloudflare-row-policy.test.ts` in the hub repo
 for worked examples per policy kind.
 
+## Column encryption and `db_plaintext_columns`
+
+The hub encrypts most string columns at rest before writing them to the database. This protects sensitive user content (names, notes, titles) if the underlying storage is ever compromised.
+
+### What is already plaintext (never encrypted)
+
+The hub skips encryption automatically for:
+
+- Columns whose name ends in `_id` — foreign keys and member references
+- Columns whose name ends in `_at` — timestamps (`created_at`, `updated_at`, etc.)
+- Columns whose name ends in `_by` — actor columns (`created_by`, `done_by`)
+- A fixed set of well-known columns: `id`, `household_id`, `completed`, `all_day`, `status`, `type`, `category`, `week`, `emoji`, `icon`, `position`, `sort_order`, `pinned`, `key`, `version`
+
+These columns can be safely used in `WHERE` filters and `ORDER BY` clauses in SQL.
+
+### The problem with encrypted columns
+
+Columns that fall outside the list above are stored as ciphertext. That means:
+
+- `WHERE my_col = ?` will never match — the param is plaintext but the stored value is ciphertext
+- `ORDER BY my_col` produces an arbitrary order, not the string order you expect
+- `CASE my_col WHEN 'breakfast' THEN 1 ...` never matches any branch
+
+If your app has enum or date columns you need to filter or sort on in SQL, declare them as plaintext.
+
+### `db_plaintext_columns`
+
+Add this field to `manifest.json` to opt specific columns out of encryption for your app:
+
+```json
+{
+  "storage": "db",
+  "db_plaintext_columns": ["slot", "plan_date"]
+}
+```
+
+Column names are matched case-insensitively. The list is app-scoped — it does not affect other apps that happen to have columns with the same name.
+
+**When to use it:**
+
+- Fixed enum columns used in `WHERE` or `ORDER BY` (e.g. `slot`, `status` if your app's `status` values differ from the global `status` skip)
+- Date columns that don't end in `_at` (e.g. `plan_date`, `due_date`, `birth_date`) — these are never sensitive and must be comparable in SQL
+- Any column you need to compare against a literal value in SQL
+
+**When not to use it:**
+
+- Free-text fields entered by the user (names, notes, titles, messages) — these should remain encrypted
+- Columns that are only ever read back whole and displayed, never filtered or sorted
+
+**Backward compatibility:** Rows inserted before a column was added to `db_plaintext_columns` have their value stored encrypted. The hub decrypts them correctly on read (it checks each value before decrypting), so old and new rows coexist safely. SQL-level filters and ordering will only work for rows inserted after the column was declared plaintext.
+
 ## AI access (MCP)
 
 Apps are **invisible to AI clients by default**. Opt in explicitly — this is intentional: private apps (couples apps, therapy notes, etc.) should never appear in AI tool listings.
