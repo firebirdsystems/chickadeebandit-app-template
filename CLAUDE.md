@@ -672,10 +672,11 @@ data already lives in its own database file.
 The hub validates and rejects any migration that contains:
 
 - `DROP TABLE` / `DROP COLUMN` / `RENAME COLUMN` / `RENAME TABLE` / `TRUNCATE`
-- `CREATE FUNCTION` / `CREATE PROCEDURE` / `CREATE TRIGGER`
-- `SECURITY DEFINER`, `GRANT`, `REVOKE`, `CREATE EXTENSION`, `CREATE ROLE`
-- `PRAGMA`, `ATTACH DATABASE`, `VACUUM INTO`
-- `CREATE TABLE` without `IF NOT EXISTS`, or `ALTER TABLE ADD COLUMN` without `IF NOT EXISTS`
+- `CREATE TRIGGER` / `CREATE VIEW` (including the `TEMP` / `TEMPORARY` forms) — trigger and view
+  bodies run SQL that the hub cannot scope, so they could read or write other apps' tables and
+  bypass per-app table isolation. Do the equivalent work in your app/server code instead.
+- `PRAGMA`, `ATTACH DATABASE`, `VACUUM`
+- `CREATE TABLE` without `IF NOT EXISTS`
 - Any `CREATE`/`DROP`/`ALTER TABLE|INDEX|VIEW|TRIGGER` whose target table name doesn't start with your app's `app_{appId}__` prefix
 
 Row-level access restrictions are **not** expressed in SQL (no `CREATE POLICY`/RLS) —
@@ -1083,6 +1084,136 @@ EXISTS(
   WHERE r.survey_id = s.id AND r.member_id = ?
 ) AS i_responded
 ```
+
+## Multi-party agreements — `agreements`
+
+For any flow where two or more named participants must each consent before a record is "locked" (borrow requests, family contracts, parental agreements, shared commitments), use the `agreements` manifest mechanism instead of storing agreement flags in a `party_scoped` table.
+
+**Why you can't do this with `party_scoped` alone:** `party_scoped` limits *which rows* a member can read/write, but any party can still UPDATE any column — including other parties' agreement flags — directly via `/api/db`. There is no column-level immutability in row policies. The only way to prevent a member from forging their counterpart's consent is to route all writes through a trusted hub endpoint.
+
+### How it works
+
+Declare `agreements` in `manifest.json`. The hub exposes `POST /run/{appId}/api/agree`, which:
+
+1. Resolves the caller's `member_id` from the session (cannot be spoofed)
+2. Reads the agreement row; if it doesn't exist and `init_from_table` is configured, bootstraps it by copying `init_columns` from the source table
+3. Verifies the caller is a participant (their id must be in one of the `participant_columns`)
+4. Sets only the caller's own flag (`agreement_columns[callerId]`) to `agreed` (true) or `0` (false)
+5. If all flags are now true, sets `status_column` to `locked_value` and records `locked_at`
+
+### Table layout
+
+Split into two tables — item details in a `party_scoped` table, agreement state in a separate `endpoint_only` table:
+
+```sql
+-- Item details: parties can read/edit terms
+CREATE TABLE IF NOT EXISTS app_myapp__requests (
+  id          TEXT PRIMARY KEY,
+  borrower_id TEXT NOT NULL,
+  lender_id   TEXT NOT NULL,
+  item_name   TEXT NOT NULL,
+  -- ... other item-detail columns ...
+  status      TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'cancelled' | 'returned'
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
+-- Agreement state: only api/agree may write
+CREATE TABLE IF NOT EXISTS app_myapp__request_agreements (
+  id              TEXT PRIMARY KEY,  -- same id as requests
+  borrower_id     TEXT NOT NULL,     -- copied from requests on init
+  lender_id       TEXT NOT NULL,
+  borrower_agreed INTEGER NOT NULL DEFAULT 0,
+  lender_agreed   INTEGER NOT NULL DEFAULT 0,
+  status          TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'locked'
+  locked_at       TEXT,
+  updated_at      TEXT NOT NULL
+);
+```
+
+### Manifest config
+
+```json
+{
+  "row_policies": {
+    "requests": {
+      "kind": "party_scoped",
+      "member_columns": ["borrower_id", "lender_id"],
+      "self_column": "borrower_id"
+    },
+    "request_agreements": {
+      "kind": "endpoint_only",
+      "read": "everyone"
+    }
+  },
+  "agreements": {
+    "request_agreements": {
+      "participant_columns": ["borrower_id", "lender_id"],
+      "agreement_columns": { "borrower_id": "borrower_agreed", "lender_id": "lender_agreed" },
+      "status_column": "status",
+      "pending_value": "pending",
+      "locked_value": "locked",
+      "locked_at_column": "locked_at",
+      "updated_at_column": "updated_at",
+      "init_from_table": "requests",
+      "init_columns": ["borrower_id", "lender_id"]
+    }
+  }
+}
+```
+
+- `participant_columns` — columns whose values name the valid participants; hub rejects callers not in this set
+- `agreement_columns` — maps each participant column name to the boolean flag column that participant controls
+- `init_from_table` + `init_columns` — when the agreement row doesn't exist yet, the hub INSERTs it by copying these columns from the named table (same `id`). Required when the agreement table is `endpoint_only` and the client cannot INSERT into it directly.
+- `locked_at_column` / `updated_at_column` — optional; hub sets them server-side
+
+### Client flow
+
+```js
+// After inserting into the party_scoped table:
+await db(`INSERT INTO app_myapp__requests (...) VALUES (...)`, [...]);
+// Trigger init_from_table + set caller's own flag:
+await fetch(`/run/${APP_ID}/api/agree`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ table: "request_agreements", id, agreed: true }),
+});
+
+// When the other party agrees:
+await fetch(`/run/${APP_ID}/api/agree`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ table: "request_agreements", id: reqId, agreed: true }),
+});
+// Hub sets both flags; if both true, sets status='locked', locked_at=now
+
+// When a party edits terms (reset their agreement; other party must re-agree):
+await db(`UPDATE app_myapp__requests SET item_name=?, updated_at=? WHERE id=?`, [...]);
+await fetch(`/run/${APP_ID}/api/agree`, { ..., body: JSON.stringify({ table: "request_agreements", id: reqId, agreed: false }) });
+await fetch(`/run/${APP_ID}/api/agree`, { ..., body: JSON.stringify({ table: "request_agreements", id: reqId, agreed: true }) });
+```
+
+### Reading effective status
+
+JOIN the two tables and derive `status` via CASE — the party_scoped table's `status` tracks terminal states (cancelled, returned), while the agreement table tracks the in-progress lock:
+
+```sql
+SELECT
+  r.*,
+  COALESCE(ra.borrower_agreed, 0) AS borrower_agreed,
+  COALESCE(ra.lender_agreed, 0)   AS lender_agreed,
+  CASE
+    WHEN r.status IN ('cancelled', 'returned') THEN r.status
+    WHEN ra.status = 'locked'                  THEN 'locked'
+    ELSE 'pending'
+  END AS status,
+  ra.locked_at
+FROM app_myapp__requests r
+LEFT JOIN app_myapp__request_agreements ra ON ra.id = r.id
+WHERE (r.borrower_id = ? OR r.lender_id = ?)
+```
+
+Reference implementation: `borrowing` app (`migrations/002_agreement_state.sql`, `manifest.json` `agreements` block, `src/index.html` `loadRequests`/`createRequest`/`updateRequest`/`agreeOnServer`).
 
 ## Security pitfalls
 
