@@ -1313,6 +1313,50 @@ function canManage(item, me) {
 }
 ```
 
+#### Privileged-group gates: no "all adults" fallback when unconfigured
+
+The same trap bites harder for `insert_privileged_only` / `write_privileged_only`
+tables gated by a `bypass_group_setting` (board/committee group). The hub treats a
+member as privileged **only** when the group is configured, still exists, and the
+member is in it — there is **no adult fallback** when the setting is unset or
+points at a deleted group (`bypass_group_setting`: *"If the setting is unset, no
+one gets this bypass"*). A client gate that returns `true` for adults when no
+group is configured shows write UI the hub then 403s on every INSERT:
+
+```js
+// ❌ Wrong — "all adults are board until a group is picked". The hub rejects
+//    every privileged INSERT while the group is unset, so adults see add/upload
+//    buttons that silently fail.
+function isBoard(me, groups, boardGroupId) {
+  if (!isAdult(me)) return false;
+  if (!boardGroupId) return true;                 // ← divergence from the hub
+  const g = groups.find(g => g.id === boardGroupId);
+  return g ? g.memberIds.includes(me.id) : true;  // ← dangling group also wrong
+}
+
+// ✅ Correct — mirrors the hub's memberInAppGroupSetting exactly.
+function isBoard(me, groups, boardGroupId) {
+  if (!isAdult(me) || !boardGroupId) return false;
+  const g = groups.find(g => g.id === boardGroupId);
+  return !!g && g.memberIds.includes(me.id);
+}
+```
+
+Two consequences to handle in the UI when no group is configured: (1) hide the
+privileged write controls and show a "an admin must configure the … group"
+notice; (2) keep the group-selection settings reachable by a **hub admin**
+(`window.__IS_ADMIN`), not gated behind the privileged role itself — otherwise no
+one can ever appoint the first group (bootstrap deadlock).
+
+**Test it.** Every gate fronting a privileged table must satisfy the shared
+contract in `__tests__/helpers/privileged-gate.mjs` — call
+`testPrivilegedGateContract` from your `logic.test.mjs`. It asserts the gate
+returns `false` for the unconfigured and dangling-group cases, which is exactly
+the divergence that shipped broken in document-library / amenity-reservations /
+architectural-review (fixed 2026-06-28). A single-sided unit test that asserts
+the *wrong* contract will pass while the app is broken — the helper pins the
+client gate to the hub's actual behavior.
+
 ### `publishes` / `alert_on` require an actual endpoint call
 
 Declaring these fields in `manifest.json` does not cause events to be emitted — your code must call the events endpoint after the action. A manifest with `publishes: ["survey.closed"]` but no `publishEvent` call after the status UPDATE means the integration is silently non-functional.
