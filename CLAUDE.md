@@ -924,8 +924,24 @@ a transaction against another member's bank by guessing its id.
   (like everyone else) are restricted to `member_column = <caller>`.
 - `INSERT`: always forces `member_column` to the caller — you own what you create.
 - Add `"insert_privileged_only": true` (requires `bypass_group_setting`) to block `INSERT` for everyone except the privileged group — returns 403 for all other callers regardless of adult status. The column is still forced to the caller for privileged inserts. SELECT/UPDATE/DELETE are unaffected by this flag.
+- Add `"write_visibility_scoped": true` for **writes that follow reads**: a
+  caller may `UPDATE`/`DELETE` exactly the rows they can `SEE` (their own, plus
+  rows whose `visibility_column` grants them read). This supersedes both
+  `write_owner_only` and the default "any adult writes any row" — a member who
+  cannot see a row can no longer blind-write or blind-delete it either.
+  Privileged members (`bypass_group_setting`) still write any row; non-adults
+  remain bound by `delete_adult_only`/`update_forbidden_columns`. Use it for
+  **collaboratively-edited, audience-scoped** tables — a group/committee working
+  doc, a shared binder — where the whole visible audience co-edits but outsiders
+  must not touch rows they can't even see. This is the only way to enforce
+  "the audience co-edits, others can't write" without routing writes through an
+  endpoint. (Note the fail-safe: if you flip an app-wide setting that widens a
+  row's audience, a non-privileged caller who can't yet see a row can't re-key
+  it — the failure is over-restrictive, never a disclosure.) `in-case-of-emergency`
+  is the reference (`created_by`/`visibility` in `adults`/`group`, all adults or a
+  configured group co-edit).
 
-Example: streaks `streaks` (`owner_id`/`visibility` in `private`/`adults`/`everyone`); architectural-review `requests` (`submitted_by`/`visibility` in `public`/`private`, with the committee group privileged to see `private` requests and decide on any request); document-library `documents` (`created_by`/`visibility`, everyone reads, only board group may insert).
+Example: streaks `streaks` (`owner_id`/`visibility` in `private`/`adults`/`everyone`); architectural-review `requests` (`submitted_by`/`visibility` in `public`/`private`, with the committee group privileged to see `private` requests and decide on any request); document-library `documents` (`created_by`/`visibility`, everyone reads, only board group may insert); in-case-of-emergency `entries` (`write_visibility_scoped` — the visible audience co-edits, outsiders can't write).
 
 #### `adult_only` — entire table restricted to adults
 
@@ -1009,6 +1025,7 @@ their own violations; board members see/log on any violation); document-library
 | Same, but writes must go through a hub endpoint (e.g. vote receipts) | `owner_only` with `endpoint_writes_only: true` |
 | Like the above, but the row references another owned row (e.g. a transaction against a bank) | `owner_only_with_fk_check` |
 | A row can be private, shared with adults, or shared with everyone | `owner_or_visibility` |
+| The visible audience (all adults, or a configured group) should co-edit rows, but no one may write a row they can't see | `owner_or_visibility` with `write_visibility_scoped: true` |
 | Table-wide, adults-only data (account balances, fund totals) | `adult_only` |
 | Shared between exactly two partnered members | `couple_scoped` |
 | Votes/comments/logs/check-offs whose visibility should match a parent record | `inherit_visibility` |
