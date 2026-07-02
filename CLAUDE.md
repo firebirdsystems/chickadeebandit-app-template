@@ -13,6 +13,7 @@ const STORE           = window.__STORE_URL      ?? "";  // key-value store
 const FILES           = window.__FILES_URL      ?? "";  // file upload endpoint
 const DOCS            = window.__DOCS_URL       ?? "";  // hub-native document storage (see below)
 const CROSS_WRITE_URL = window.__CROSS_WRITE_URL ?? ""; // cross-app writes (hub-sdk crossWrite uses this)
+const APPEND_RECORD   = window.__APPEND_RECORD_URL ?? ""; // append-only D1 records (append_only_records apps only)
 const APP_ID          = window.__APP_ID         ?? "my-app";
 const ME              = window.__CURRENT_MEMBER ?? null; // { id, name, role }
 const EVENTS_URL      = window.__EVENTS_URL     ?? "/api/events";
@@ -1300,6 +1301,74 @@ WHERE (r.borrower_id = ? OR r.lender_id = ?)
 ```
 
 Reference implementation: `borrowing` app (`migrations/002_agreement_state.sql`, `manifest.json` `agreements` block, `src/index.html` `loadRequests`/`createRequest`/`updateRequest`/`agreeOnServer`).
+
+## Append-only records — `append_only_records`
+
+For immutable history rows, receipts, predictions, audit notes, and other "add a new record, never edit/delete it" data, use `append_only_records` instead of writing the table directly through `/api/db`.
+
+The hub exposes `POST /run/{appId}/api/append-record/{name}` and injects `window.__APPEND_RECORD_URL` when the app declares the manifest field. The endpoint:
+
+- accepts only whitelisted columns
+- derives the row id, writer member id, and timestamp server-side
+- optionally verifies a parent row exists
+- optionally blocks appends when the parent is in a closed status
+- enforces string length and enum allowlists
+- inserts while bypassing the table's `endpoint_only` write block
+
+Pair each append-only target table with either `row_policies.{table}.kind = "endpoint_only"` or an existing read policy that supports `"endpoint_writes_only": true` so direct app SQL cannot `INSERT`, `UPDATE`, or `DELETE` rows. Use `endpoint_only` for household-readable logs; use `endpoint_writes_only` on policies like `owner_only`, `adult_writable`, or `inherit_visibility` when reads still need owner/private/inherited filtering.
+
+```jsonc
+{
+  "row_policies": {
+    "notes": { "kind": "endpoint_only", "read": "everyone" }
+  },
+  "append_only_records": {
+    "notes": {
+      "table": "notes",
+      "parent_table": "items",
+      "parent_fk_column": "item_id",
+      "parent_status_column": "status",
+      "parent_blocked_status_values": ["closed", "voided"],
+      "allowed_columns": ["item_id", "body", "kind"],
+      "writer_column": "created_by",
+      "created_at_column": "created_at",
+      "write_acl": {
+        "require_role": "adult"
+      },
+      "allowed_values": {
+        "kind": ["note", "receipt"]
+      },
+      "max_text_lengths": {
+        "body": 2000,
+        "kind": 20
+      }
+    }
+  }
+}
+```
+
+```js
+async function appendRecord(name, data) {
+  const res = await fetch(`${window.__APPEND_RECORD_URL}/${encodeURIComponent(name)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  const json = await res.json();
+  if (!res.ok || json.error) throw new Error(json.error || "Append failed");
+  return json; // { success: true, id, created_at? }
+}
+
+await appendRecord("notes", {
+  item_id: itemId,
+  kind: "receipt",
+  body: "Screenshot saved before the decision changed.",
+});
+```
+
+Use this for immutable children only. It does not enforce multi-party consent or state-machine decisions; use `agreements`, a more specific generic endpoint, or a new reusable protocol for those.
+
+`write_acl` is optional. Use `"require_role": "adult"` for adult-only appends, or `"require_group_setting": { "settings_table": "settings", "settings_key": "committee_group_id" }` when only members of a configured Hub group may append. Household admins bypass group membership checks.
 
 ## Security pitfalls
 
