@@ -27,9 +27,10 @@
       "kind": "owner_only",
       "member_column": "member_id",
       "adults_bypass": true,
-      "unique_per_member": {
+      "max_per_member": {
         "member_column": "member_id",
-        "scope_columns": ["event_id", "slot_id"]
+        "scope_columns": ["event_id", "slot_id"],
+        "limit": 1
       }
     }
   },

@@ -861,8 +861,12 @@ same restrictions.
   silently under-enforced — keep queries against governed tables to simple
   single-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`.
 - On a policy violation, `/api/db` returns `403` with `{ "error": "..." }`.
-- `unique_per_member` is an INSERT-only modifier available on any policy kind.
-  It enforces one row per member per declared scope inside `executeAppSql`.
+- `max_per_member` is an INSERT-only modifier available on any policy kind.
+  It enforces at most `limit` rows per member per declared scope inside
+  `executeAppSql` (`limit: 1` is the classic "one row per member").
+- `max_rows` is an INSERT-only modifier available on any policy kind: a
+  table-wide cap on the total number of rows. It also covers rows written by
+  external share-link submissions into that table.
 - `frozen_when` is a write-freeze modifier available on any policy kind:
   `{ "status_column": "status", "locked_values": ["adopted", "closed"] }`.
   Use it when a row should become immutable after a lifecycle state, such as
@@ -878,6 +882,11 @@ same restrictions.
   (`"owner"` / `"adult"` / `"privileged"`). Use it when the whole row is
   readable but one column is not — a word-game secret word visible only to the
   setter, a valuation column visible only to adults.
+- `column_write_acls` is the write-side counterpart of `column_read_acls`:
+  it restricts who may write individual columns on `INSERT`/`UPDATE`.
+- `retain_days` is a hub-managed **automatic expiry** modifier: the daily
+  maintenance runner deletes rows older than `default` days by `timestamp_column`.
+  App SQL never gets this power.
 
 ### Policy kinds
 
@@ -945,37 +954,56 @@ Read-all, **write-none via `/api/db`**. The only writer is `POST /run/{app}/api/
 
 Example: piggy-bank `piggy_banks`/`transactions` — a child only sees their own bank/transactions; adults (parents) see everyone's. Vote receipts for attributed polls — each member can see their own receipt (confirming they voted), but all receipt creation goes through the `submit-response` hub endpoint.
 
-#### `unique_per_member` — one row per member per scope
+#### `max_per_member` — at most N rows per member per scope
 
-Use `unique_per_member` when the row is **not secret** but each member should only
-be able to create one row within a logical scope: one RSVP per event, one rating
-per watchlist title, one guess per trivia round, one claim per slot.
+Use `max_per_member` when the row is **not secret** but each member should only
+be able to create a bounded number of rows within a logical scope: one RSVP per
+event (`limit: 1`), one rating per watchlist title, one guess per trivia round,
+up to three votes per poll, and so on.
 
 ```json
 {
   "kind": "owner_only",
   "member_column": "member_id",
   "adults_bypass": false,
-  "unique_per_member": {
+  "max_per_member": {
     "member_column": "member_id",
-    "scope_columns": ["event_id"]
+    "scope_columns": ["event_id"],
+    "limit": 1
   }
 }
 ```
 
+- `limit` is a positive integer — the maximum rows one member may hold within
+  the scope. `limit: 1` reproduces the classic "exactly one row per member".
 - Applies only to `INSERT`; it does not make existing rows immutable.
 - The `member_column` and every `scope_columns` entry must be explicitly present
   in the INSERT column list. The policy first applies the base row policy, so
-  owner policies still force the member column to the caller before the uniqueness
+  owner policies still force the member column to the caller before the count
   check runs.
-- The hub rejects duplicates already in the table and duplicates within the same
-  multi-row INSERT. On violation, `/api/db` returns `403`.
+- The hub counts the member's existing matching rows plus the rows in the same
+  multi-row INSERT; if the total would exceed `limit`, `/api/db` returns `403`.
+- A scope entry may be a plain column name **or** a derived key
+  `{ "column": "date", "transform": "month" }`, which buckets an ISO date/datetime
+  column by its `"YYYY-MM"` prefix — e.g. "at most N reservations per amenity per
+  calendar month". Derived scopes are compared in JS after decryption, so they
+  work on encrypted columns and cannot be dodged with a separate stored column.
 - This is for **attributed/non-secret** participation. If the answer or ballot
   must not be linkable to the member, use `anonymous_responses` or
   `anonymous_ballot` with a receipt table instead.
 - If the row also has a capacity constraint ("claim iff seats/shifts/slots remain"),
-  use `slot_claims` instead. A row policy can enforce uniqueness, but it cannot
+  use `slot_claims` instead. A row policy can bound per-member counts, but it cannot
   atomically check `COUNT(existing claims) < capacity` while inserting.
+
+#### `max_rows` — a table-wide row cap
+
+Add `"max_rows": 200` to any policy to cap the total number of rows the table may
+hold. On `INSERT`, the hub counts the current rows plus the rows being inserted;
+if the total would exceed the cap it rejects the write with a `DB_LIMIT_EXCEEDED`
+error (HTTP `507`). The cap also applies to rows written by external
+share-link submissions into that table, so it is the declarative replacement for
+ad-hoc "max external submissions" guards. It is a coarse abuse ceiling, not a
+per-member limit — combine it with `max_per_member` when you need both.
 
 #### `frozen_when` — immutable after adopted / closed / archived
 
@@ -1053,10 +1081,80 @@ top of the base policy's row filter.
   comparison or ordering oracle. **Assigning** the column (`INSERT`,
   `UPDATE ... SET secret_word = ?`) is allowed, so the owner can still write it.
 - You cannot mask a policy-structural column (the owner column, `visibility_column`,
-  a `unique_per_member` scope column, `frozen_when.status_column`, etc.) — manifest
+  a `max_per_member` scope column, `frozen_when.status_column`, etc.) — manifest
   validation rejects it, because the hub itself compares those columns.
-- This masks **reads**; it does not make the column immutable. For write control of
-  a column, keep it out of the writable table or write it through an endpoint.
+- This masks **reads**; it does not make the column immutable. For **write** control
+  of a column, use `column_write_acls` (below).
+
+#### `column_write_acls` — per-column write governance (cross-kind modifier)
+
+The write-side counterpart of `column_read_acls`, valid on **every** policy kind.
+Restricts who may write individual columns on `INSERT`/`UPDATE`:
+
+```json
+"column_write_acls": {
+  "status":    { "writable_by": ["adult"] },
+  "locked_at": { "writable_by": [], "actions": ["update"] },
+  "signed":    { "writable_by": ["owner"], "owner_column": "supervisor_id" }
+}
+```
+
+- Each key is a column. `writable_by` lists the principals allowed to write it:
+  - `"adult"` — `memberRole === "adult"` (capability).
+  - `"privileged"` — a `privileged_groups` entry covering the governed write
+    action(s) (`insert`/`update`); manifest validation requires such a group.
+  - `"owner"` — the row owner. **Fail-closed**: on `INSERT` the row's owner value
+    must equal the caller; on `UPDATE` the hub appends `AND <owner_column> = <caller>`
+    so the write only lands on the caller's own rows. Defaults to the policy's owner
+    column; set `owner_column` to point at a different column (e.g. one participant's
+    slot), which is how each party writes only its own agreement flag.
+- **Empty `writable_by: []` forbids the write** — the column is immutable for that
+  action (or endpoint-only, since trusted hub endpoints bypass row policies). Pair
+  with `actions` to make a column *set-once* (`"actions": ["update"]` → writable on
+  insert, frozen after) or *set-later-only* (`"actions": ["insert"]` → blocked at
+  creation, written later).
+- `actions` (optional, default `["insert","update"]`) scopes the ACL to a subset of
+  write actions. A caller who satisfies no listed principal gets a 403.
+- A single `UPDATE` that writes two owner-columns bound to different owners is
+  rejected — a member can only be one owner.
+
+#### `retain_days` — hub-managed automatic expiry (cross-kind modifier)
+
+Declares a retention window for one table; the hub's **daily maintenance runner**
+deletes rows whose `timestamp_column` is older than `default` days. App SQL is
+never granted this power — the bounded delete runs as trusted code, so a member
+cannot use it to purge rows early. Valid on any policy kind.
+
+```json
+"retain_days": {
+  "default": 90,
+  "timestamp_column": "created_at",
+  "id_column": "id",
+  "override_key": "messages",
+  "dependent_tables": [
+    { "table": "message_reactions", "foreign_key": "message_id" }
+  ]
+}
+```
+
+- `default` — positive integer number of days to keep a row after
+  `timestamp_column`.
+- `timestamp_column` — the plaintext date/datetime column the age is measured
+  from (`created_at` and other `_at` columns are already plaintext; a custom
+  column must be listed in `db_plaintext_columns`).
+- `id_column` (optional, default `"id"`) — the primary key used to page the
+  delete.
+- `override_key` (optional) — a shared name so several tables (or an admin
+  setting) resolve to one retention value; all entries under one key must use the
+  same `default`.
+- `dependent_tables` (optional) — child rows to remove **before** an expired
+  parent row, for legacy schemas that can't add `ON DELETE CASCADE` in an
+  additive migration. Each is `{ table, foreign_key }` and must itself have a row
+  policy.
+
+Use it for ephemeral logs, chat history, location pings, and any table with a
+"keep N days" policy. It affects only deletion timing — reads/writes still obey
+the base policy kind.
 
 #### `owner_only_with_fk_check` — like `owner_only`, but the row references another owned row
 
@@ -1108,7 +1206,7 @@ a transaction against another member's bank by guessing its id.
   Privileged members (entry covering the write action) still write any row —
   a select-only entry instead widens the rows such a member may co-edit,
   since writes follow reads; non-adults
-  remain bound by `delete_adult_only`/`update_forbidden_columns`. Use it for
+  remain bound by `delete_adult_only` (and any `column_write_acls`). Use it for
   **collaboratively-edited, audience-scoped** tables — a group/committee working
   doc, a shared binder — where the whole visible audience co-edits but outsiders
   must not touch rows they can't even see. This is the only way to enforce
@@ -1149,6 +1247,61 @@ caller's id or their configured partner's id (looked up from
 `partner_table`). `INSERT` forces `self_column` to the caller and rejects
 any `participant_columns` value that isn't the caller or their partner.
 Assumes exactly one partner per member — not for group/throuple apps.
+
+#### `party_scoped` — visible/writable by any of an arbitrary set of named members
+
+```json
+{
+  "kind": "party_scoped",
+  "member_columns": ["borrower_id", "lender_id"],
+  "self_column": "borrower_id"
+}
+```
+
+Like `couple_scoped` but for **N named participants with no configured partner
+relationship** — borrow requests, expense splits, marketplace deals. A row is
+visible/writable if the caller's id appears in **any** of `member_columns`.
+`self_column` (optional) is forced to the caller on `INSERT`. Set
+`"endpoint_writes_only": true` to block app-originated writes while keeping the
+party-scoped read filter (writes then go through a trusted hub workflow).
+
+Note: `party_scoped` limits *which rows* each party may write, but any party can
+still write *any column* on a shared row. When each participant must consent
+without being able to forge another's flag, put the consent state in a separate
+`endpoint_only` table and use the `agreements` mechanism (see below), or gate the
+columns with `column_write_acls` `owner_column`.
+
+#### `channel_scoped` — visibility follows per-channel membership
+
+For chat/forum-style rows whose audience is a channel's membership (all-household,
+a role, or an explicit member list):
+
+```json
+{
+  "kind": "channel_scoped",
+  "channels_table": "channels",
+  "channel_id_column": "channel_id",
+  "membership_type_column": "membership_type",
+  "membership_roles_column": "membership_roles",
+  "membership_table": "channel_members",
+  "membership_channel_column": "channel_id",
+  "membership_member_column": "member_id",
+  "self_column": "author_id"
+}
+```
+
+- A row (e.g. a message) is visible/writable iff the caller is a member of the
+  channel it references (`channel_id_column` → `channels_table.id`). Channel
+  membership is one of: `all_value` (whole household), `role_value` (a role named
+  in `membership_roles_column`), or an explicit row in `membership_table`
+  (`group_value`). `all_value`/`role_value` default to `"all"`/`"role"`.
+- `membership_type_column` and `membership_roles_column` must be plaintext
+  (list them in `db_plaintext_columns`) — the hub compares them.
+- `self_column` (optional) is forced to the caller on `INSERT`, so a member can't
+  post as someone else.
+- `group-channels` is the reference implementation; the parallel
+  `subscription_notify` `eligibility` block mirrors this shape for follower
+  fan-out.
 
 #### `inherit_visibility` — a child row's access follows its parent row
 
@@ -1204,7 +1357,7 @@ table, make moves/questions/guesses an `inherit_visibility` child table, and set
 `insert_only_by_parent_column_member: "current_turn_member_id"` on that child
 policy. This covers async turn rotation for Word Game / 20 Questions / Draw &
 Guess-style apps without a bespoke server endpoint per game. Pair it with
-`unique_per_member` when the child table also needs one attributed row per round
+`max_per_member` when the child table also needs one attributed row per round
 or turn.
 
 #### `sealed_until` — owners see their response until the parent closes, then everyone sees
@@ -1223,9 +1376,10 @@ can read all responses.
   "writer_column": "member_id",
   "parent_status_column": "status",
   "visible_parent_status_values": ["closed"],
-  "unique_per_member": {
+  "max_per_member": {
     "member_column": "member_id",
-    "scope_columns": ["round_id"]
+    "scope_columns": ["round_id"],
+    "limit": 1
   },
   "frozen_when": {
     "status_column": "status",
@@ -1242,7 +1396,18 @@ can read all responses.
   or delete responses after the parent round closes.
 - `parent_status_column` must be plaintext. `status` is built in; custom release
   columns such as `round_state` must be listed in `db_plaintext_columns`.
-- Pair with `unique_per_member` for "one answer/guess/bid per member per round."
+- Add `"visible_after_parent_column": "reveal_date"` for a **clock-based reveal**:
+  a plaintext ISO date/datetime column on the parent releases all rows once its
+  value is at or before the hub's current time, OR'd with the status-based release
+  above. The hub enforces the clock — the app cannot make a still-sealed capsule
+  open early, and reveal happens even if no one clicks a Reveal button. A plain
+  `_date` column ("2026-07-09") opens from the start of that UTC day; a datetime
+  column releases at the instant it names. Use it for time capsules and scheduled
+  reveals; leave it off for reveals driven purely by a status change. Mirror it in
+  any client "is this released?" gate (compare `reveal_date <= new Date().toISOString()`)
+  so the UI matches what the hub will actually return. `time-capsule` is the
+  reference implementation.
+- Pair with `max_per_member` for "one answer/guess/bid per member per round."
   This is still attributed data, so do not use it for anonymous surveys or secret
   ballots; use `anonymous_responses` / `anonymous_ballot` when the response row
   must not identify the member.
@@ -1263,7 +1428,7 @@ rows and `sealed_until` for the final per-member responses.
 | Same, but non-adults should only read their own rows | `adult_writable` with `member_read_column` |
 | Settings row that names a privileged group (board_group_id, committee_group_id) | `app_config` |
 | One row per member, only that member (and maybe adults) should see it | `owner_only` |
-| One attributed submission per member per event/round/title/slot | Any suitable row policy plus `unique_per_member` |
+| One attributed submission per member per event/round/title/slot | Any suitable row policy plus `max_per_member` |
 | Same, but writes must go through a hub endpoint (e.g. vote receipts) | `owner_only` with `endpoint_writes_only: true` |
 | Like the above, but the row references another owned row (e.g. a transaction against a bank) | `owner_only_with_fk_check` |
 | A row can be private, shared with adults, or shared with everyone | `owner_or_visibility` |
@@ -1271,9 +1436,14 @@ rows and `sealed_until` for the final per-member responses.
 | The visible audience (all adults, or a configured group) should co-edit rows, but no one may write a row they can't see | `owner_or_visibility` with `write_visibility_scoped: true` |
 | Table-wide, adults-only data (account balances, fund totals) | `adult_only` |
 | Shared between exactly two partnered members | `couple_scoped` |
+| Shared among an arbitrary set of named members (borrow request, expense split) | `party_scoped` |
+| Rows whose audience is a chat/forum channel's membership | `channel_scoped` |
+| Cap the total rows a table may hold (incl. external submissions) | any kind plus `max_rows` |
+| Auto-expire rows after N days (ephemeral logs, chat history, location pings) | any kind plus `retain_days` |
 | Votes/comments/logs/check-offs whose visibility should match a parent record | `inherit_visibility` |
 | Turn-based child rows where only the current player may INSERT (moves, questions, guesses) | `inherit_visibility` with `insert_only_by_parent_column_member: "current_turn_member_id"` |
-| Attributed responses hidden from everyone except the owner until the parent closes | `sealed_until` with `visible_parent_status_values: ["closed"]`; usually add `unique_per_member` and `frozen_when` |
+| Attributed responses hidden from everyone except the owner until the parent closes | `sealed_until` with `visible_parent_status_values: ["closed"]`; usually add `max_per_member` and `frozen_when` |
+| Sealed entries that must open on a wall-clock date, hub-enforced (time capsule, scheduled reveal) | `sealed_until` with `visible_after_parent_column: "reveal_date"` |
 | Anonymous data with no per-row ownership at all (e.g. cast ballots, raw anonymous responses) | `endpoint_only` with `read:"none"` — pair with a receipt table under `owner_only` + `adults_bypass:false` + `member_can_update:false` + `endpoint_writes_only:true`; use `anonymous_responses` or `anonymous_ballot` manifest mechanisms to write both atomically |
 | Everyone can read, but only a specific group may INSERT (e.g. board-managed docs) | `owner_or_visibility` with `everyone_values`, `write_owner_only: true`, and `insert_privileged_only: true` |
 | Child rows where only a privileged group may create them (e.g. document versions) | `inherit_visibility` with `insert_privileged_only: true` |
@@ -1370,7 +1540,7 @@ for how you write those `.sql` files:
 
 For sign-up sheets, shift claims, carpool seats, babysitting co-op coverage, amenity slots, and any "claim iff capacity remains" flow, use the `slot_claims` manifest mechanism instead of writing the claims table directly through `/api/db`.
 
-**Why you can't do this with row_policies alone:** capacity is a cross-row invariant. A browser can read "2 seats left" and then race another browser before inserting; `unique_per_member` can prevent duplicate claims by the same member, but it cannot atomically enforce `COUNT(claims) < slots.capacity`.
+**Why you can't do this with row_policies alone:** capacity is a cross-row invariant. A browser can read "2 seats left" and then race another browser before inserting; `max_per_member` can prevent duplicate claims by the same member, but it cannot atomically enforce `COUNT(claims) < slots.capacity`.
 
 ### How it works
 
@@ -1621,7 +1791,7 @@ EXISTS(
 
 For any flow where two or more named participants must each consent before a record is "locked" (borrow requests, family contracts, parental agreements, shared commitments), use the `agreements` manifest mechanism instead of storing agreement flags in a `party_scoped` table.
 
-**Why you can't do this with `party_scoped` alone:** `party_scoped` limits *which rows* a member can read/write, but any party can still UPDATE any column — including other parties' agreement flags — directly via `/api/db`. There is no column-level immutability in row policies. The only way to prevent a member from forging their counterpart's consent is to route all writes through a trusted hub endpoint.
+**Why prefer the `agreements` mechanism:** it also provides atomic locking, snapshot-freezing of agreed values, and bootstrap-from-source — server-side logic a row policy can't express. If all you need is *forgery prevention* (each party may only write its own flag), you can instead keep a single governed table and add `column_write_acls` giving each flag column `{ "writable_by": ["owner"], "owner_column": "<that party's member column>" }` — the hub then appends a per-party owner guard so a member cannot forge their counterpart's consent via `/api/db`. Reach for the `agreements` endpoint when you also need the locking/snapshot semantics below.
 
 ### How it works
 
