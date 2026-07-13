@@ -1,15 +1,15 @@
 {
   "id": "app-template",
-  "name": "Chickadee Bandit App Template",
+  "name": "App Template",
   "version": "1.0.0",
-  "description": "Create gatherings with dish slots and let members claim, swap, and release dishes without overbooking a category.",
+  "description": "Minimal starting point for a Chickadee Bandit app: one governed table, a demo-mode fallback, and the standard build/dev tooling. Copy it, rename the id, and build from here.",
   "entrypoint": "index.html",
   "runtime": "static",
   "category": "family",
-  "tags": ["food", "events", "potluck", "slot-claims"],
+  "tags": ["template", "starter"],
   "data_access": {
     "reads": ["family.members"],
-    "writes": ["family.members"]
+    "writes": []
   },
   "permissions": {
     "default_audience": "everyone",
@@ -17,32 +17,13 @@
   },
   "storage": "db",
   "row_policies": {
-    "events": {
+    "items": {
       "kind": "adult_writable"
-    },
-    "slots": {
-      "kind": "adult_writable"
-    },
-    "claims": {
-      "kind": "owner_only",
-      "member_column": "member_id",
-      "adults_bypass": true,
-      "max_per_member": {
-        "member_column": "member_id",
-        "scope_columns": ["event_id", "slot_id"],
-        "limit": 1
-      }
     }
   },
-  "publishes": ["potluck.event_created", "potluck.slot_claimed", "potluck.slot_released"],
-  "nav": { "label": "Potluck" },
+  "nav": { "label": "Template" },
   "resource_limits": {
     "max_db_bytes": 52428800
   },
-  "icon": "🍽️",
-  "ai_access": {
-    "allowed": true,
-    "mode": "read",
-    "db_exports": ["upcoming_potlucks", "claim_summary"]
-  }
+  "icon": "🧩"
 }

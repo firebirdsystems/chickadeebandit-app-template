@@ -1,43 +1,17 @@
-CREATE TABLE IF NOT EXISTS app_potluck__events (
-  id TEXT PRIMARY KEY,
-  title TEXT NOT NULL,
-  date TEXT NOT NULL,
-  location TEXT DEFAULT '',
-  notes TEXT DEFAULT '',
-  created_by_id TEXT NOT NULL,
-  created_by_name TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  archived INTEGER NOT NULL DEFAULT 0
+-- One example table. Adults create/edit/delete; everyone in the household reads
+-- (see the `items` row policy in manifest.json). Every table name must be
+-- prefixed with app_{appId}__ — here app_app_template__.
+--
+-- Migrations are additive only: add 002_*.sql, 003_*.sql for later changes.
+-- Never DROP/RENAME; the runner applies each version exactly once, in order.
+CREATE TABLE IF NOT EXISTS app_app_template__items (
+  id         TEXT PRIMARY KEY,
+  title      TEXT NOT NULL,
+  note       TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL,          -- member id of the author (plaintext: ends in _by)
+  created_at TEXT NOT NULL           -- ISO timestamp (plaintext: ends in _at)
 );
 
-CREATE TABLE IF NOT EXISTS app_potluck__slots (
-  id TEXT PRIMARY KEY,
-  event_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  capacity INTEGER NOT NULL DEFAULT 1 CHECK (capacity > 0),
-  sort_order INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (event_id) REFERENCES app_potluck__events(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS app_potluck__claims (
-  id TEXT PRIMARY KEY,
-  event_id TEXT NOT NULL,
-  slot_id TEXT NOT NULL,
-  member_id TEXT NOT NULL,
-  member_name TEXT NOT NULL,
-  note TEXT DEFAULT '',
-  claimed_at TEXT NOT NULL,
-  FOREIGN KEY (event_id) REFERENCES app_potluck__events(id) ON DELETE CASCADE,
-  FOREIGN KEY (slot_id) REFERENCES app_potluck__slots(id) ON DELETE CASCADE,
-  UNIQUE (slot_id, member_id)
-);
-
-CREATE INDEX IF NOT EXISTS app_potluck__events_date_idx
-  ON app_potluck__events(date, archived);
-
-CREATE INDEX IF NOT EXISTS app_potluck__slots_event_idx
-  ON app_potluck__slots(event_id, sort_order);
-
-CREATE INDEX IF NOT EXISTS app_potluck__claims_slot_idx
-  ON app_potluck__claims(slot_id, claimed_at);
+-- Newest-first listing.
+CREATE INDEX IF NOT EXISTS app_app_template__items_created_idx
+  ON app_app_template__items (created_at);

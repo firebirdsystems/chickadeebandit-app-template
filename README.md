@@ -1,6 +1,6 @@
-# Potluck
+# App Template
 
-Dish sign-up for Chickadee Bandit gatherings. Adults create potluck events with capacity-limited dish slots, and members claim, swap, or release dishes without overbooking a category.
+Minimal starting point for a Chickadee Bandit app. Copy this folder, rename the `id` in `manifest.json` (and the `app_{appId}__` table prefix to match), then build from here. Ships one governed `items` table, a demo-mode fallback, and the standard build/dev tooling. See `CLAUDE.md` for the full patterns and the row-policy / protocol reference.
 
 ---
 
