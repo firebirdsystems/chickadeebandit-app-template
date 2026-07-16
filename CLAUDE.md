@@ -2117,6 +2117,64 @@ Prefer `db_plaintext_columns` when only a few enum/date/lookup columns need to b
 
 **Backward compatibility:** Rows inserted before a column was added to `db_plaintext_columns` have their value stored encrypted. The hub decrypts them correctly on read (it checks each value before decrypting), so old and new rows coexist safely. SQL-level filters and ordering will only work for rows inserted after the column was declared plaintext.
 
+## Today view (`agenda`)
+
+The hub has one chronological **Today** view (a dashboard section plus a `/today`
+page) that merges hub-native sources — synced calendar, tasks, date-reminder
+occurrences — with rows contributed by installed apps. Your app opts in by
+declaring an `agenda` field (a sibling of `glance`): one governed SELECT that
+returns today's rows. Apps that don't declare it are never fanned out to.
+
+> **Naming note:** this is the manifest `agenda` *field*, unrelated to the
+> meetings app whose id happens to be `agenda`.
+
+```json
+{
+  "storage": "db",
+  "db_plaintext_columns": ["plan_date", "slot"],
+  "agenda": {
+    "kind": "meal",
+    "source": {
+      "kind": "sql",
+      "query": "SELECT id AS id, meal_name AS title, slot AS subtitle, plan_date AS when_at, assigned_to AS member_id FROM app_family_meals__meal_plan WHERE plan_date = :today ORDER BY CASE slot WHEN 'breakfast' THEN 0 WHEN 'lunch' THEN 1 ELSE 2 END LIMIT 10"
+    }
+  }
+}
+```
+
+Rules (all enforced at publish time by `node build.mjs` / the hub, so a broken
+agenda fails to install rather than silently showing nothing):
+
+- **Single read-only SELECT over your own `app_{id}__` tables**, with a
+  `LIMIT` between 1 and 20. No JOINs to other apps' tables, no writes.
+- **Required output aliases:** `title` and `when_at`. `when_at` is an ISO
+  datetime, a `yyyy-mm-dd` (all-day), or a bare date. Optional aliases:
+  `member_id`, `done` (0/1 or a boolean expression), `subtitle`, and a per-row
+  `kind`.
+- **Day tokens:** `:today` (household-local `yyyy-mm-dd`), `:day_start` /
+  `:day_end` (ISO instants bounding the local day). The hub binds them as
+  parameters — never string-interpolated.
+- **A day token must actually filter the query** — used in a `WHERE` or
+  `JOIN ... ON` comparison (`WHERE plan_date = :today`), not merely selected or
+  sorted on. A token that only appears in the SELECT list or `ORDER BY` is
+  rejected, because it wouldn't narrow the scan.
+- **The compared column must be plaintext.** Encrypted columns store ciphertext
+  with a random IV, so `encrypted_col = :today` never matches; publish fails.
+  Anchor your agenda on a `*_date`/`*_at` column or one listed in
+  `db_plaintext_columns` (dates are never sensitive — see the encryption
+  section above).
+- **Runs under the requesting member's `row_policies`**, exactly like `/api/db`.
+  A member only sees agenda rows they're allowed to see; a restricted or
+  owner-scoped row never leaks into another member's Today view. The Today UI's
+  per-member filter chips are presentation only — the authorization is the row
+  policy. You don't need to (and can't) widen visibility here.
+- `kind` (one of `event`/`task`/`chore`/`routine`/`meal`/`reminder`/`other`,
+  default `other`) and optional `label` control how the row is grouped/labeled.
+
+Apps that already declare a `calendar_events` export don't also need `agenda`
+for those events — the hub merges the export into Today and de-dupes. Use
+`agenda` for non-calendar rows (meals, chores, routines, assignments, etc.).
+
 ## AI access (MCP)
 
 Apps are **invisible to AI clients by default**. Opt in explicitly — this is intentional: private apps (couples apps, therapy notes, etc.) should never appear in AI tool listings.
