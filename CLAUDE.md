@@ -2175,6 +2175,90 @@ Apps that already declare a `calendar_events` export don't also need `agenda`
 for those events — the hub merges the export into Today and de-dupes. Use
 `agenda` for non-calendar rows (meals, chores, routines, assignments, etc.).
 
+## Kiosk quick-add (`kiosk_quick_add`)
+
+Shared-device **kiosk** mode has exactly one PIN-free write lane: a card your app
+can offer for appending a text row (a grocery item, an inbox task) or flipping a
+done flag, without unlocking the kiosk to a member. Declaring the field is only
+an *offer* — writes happen solely on kiosk devices whose admin both allowlisted
+the app **and** opted it into quick-add (per-device, default off).
+
+The hub builds every statement itself from your column declarations — no client
+SQL — and runs them through the governed app-db path under the ambient (or, after
+PIN escalation, the member's) `row_policies`. A row-policied target table fails
+**closed** for the ambient identity rather than accepting an anonymous write.
+
+```json
+{
+  "storage": "db",
+  "db_encryption": "off",
+  "kiosk_quick_add": {
+    "table": "items",
+    "label": "Grocery list",
+    "text_column": "name",
+    "actions": ["add", "toggle"],
+    "normalized_column": "name_normalized",
+    "done_column": "checked",
+    "done_by_name_column": "checked_by_name",
+    "attribution": { "id_column": "added_by_id", "name_column": "added_by_name" },
+    "created_at_column": "created_at"
+  }
+}
+```
+
+### Fields
+
+- `table` (required) — UNPREFIXED table the lane writes to.
+- `label` (required, ≤ 80 chars) — the card heading on the kiosk.
+- `text_column` (required) — column holding each row's typed text.
+- `actions` (required, 1–2, no duplicates) — `["add"]` and/or `"toggle"`.
+  `add` appends a row; `toggle` flips `done_column`.
+- `normalized_column` (optional) — a column you store `lower(trim(text))` into
+  **with a UNIQUE constraint**. When set, adds run `ON CONFLICT DO NOTHING` and a
+  duplicate is *reported*, not errored. Without it, every add inserts.
+- `done_column` (required when `actions` includes `toggle`) — the integer `0`/`1`
+  flag the toggle flips atomically.
+- `done_by_name_column` (optional, requires `done_column`) — stamped with the
+  actor's display name while done, cleared on undo.
+- `attribution` (optional) — `{ id_column, name_column }` stamped on add:
+  `id_column` gets `kiosk:{deviceId}` (or the escalated member's id), `name_column`
+  gets the device (or member) display name. Attribution on the app row is separate
+  from the audit trail below.
+- `created_at_column` (optional) — stamped `datetime('now')` on add.
+- `authorization` (optional) — `"ambient"` (default) lets the unattended device
+  use the lane; `"member"` hides the card until a member PIN-escalates the kiosk
+  and rejects ambient writes. Use it for anything that shouldn't be writable by a
+  walk-up.
+- `audit` (optional) — controls the **content-free** entry the hub writes to the
+  household write-audit trail on each successful add/toggle. `"device"` (default
+  behavior) records the device id; `"member"` also records the escalated member's
+  id and **requires** `authorization: "member"`; `"none"` disables it. The typed
+  text and actor display name are never in the audit — app rows can stay anonymous
+  while operators keep a capability trail.
+- `max_items` (optional, 1–50, default 20) — rows returned on a toggle-capable
+  card. The hub separately caps a kiosk to 4 quick-add apps and 80 returned items
+  total, divided across toggle lanes.
+
+### Encryption
+
+When `db_encryption` is not `"off"`, only the columns the lane **computes in SQL**
+must be plaintext (a built-in skip suffix or listed in `db_plaintext_columns`):
+`normalized_column`, `done_column`, `done_by_name_column`, and `created_at_column`.
+`text_column` and the `attribution` columns are ordinary bound values / whole-column
+reads, so they may stay encrypted. Publish fails if a SQL-computed column is
+encrypted — a `lower(trim())` dedup or `done = 1` flip against ciphertext silently
+matches nothing.
+
+### Rules enforced at publish
+
+- `done_column` is required whenever `actions` includes `toggle`;
+  `done_by_name_column` requires `done_column`; `audit: "member"` requires
+  `authorization: "member"`.
+- The `table` and every referenced column must exist in your migrations, and
+  `normalized_column` must carry a UNIQUE constraint (both checked against the
+  migration schema).
+- An app whose manifest sets `kiosk: "never"` cannot declare a lane.
+
 ## AI access (MCP)
 
 Apps are **invisible to AI clients by default**. Opt in explicitly — this is intentional: private apps (couples apps, therapy notes, etc.) should never appear in AI tool listings.
