@@ -731,6 +731,60 @@ function canSeeItem(item) { return _canSeeItem(item, ME); }
 
 **When not to:** DB calls, render functions, event handlers, and anything that closes over module-level state belong in the HTML script and don't need extraction.
 
+## Adding search to an app
+
+Search in Chickadee is a **per-app convention**, not a protocol or a hub call.
+An app filters the rows it already loaded, in the browser, using the one shared
+matcher — so search never adds a query, an endpoint, or a security surface (the
+rows were already scoped by row policies when the app fetched them). The hub's
+own `/search` covers calendar, tasks, inbox, and the app catalog; anything
+*inside* an app is found from within that app, which is what this convention is.
+
+Use the shared matcher, `searchMatch(query, fields)`, from `/hub-sdk.js`. It
+lower-cases, strips diacritics, and requires every whitespace-separated token to
+substring-match at least one field (AND across tokens, OR across fields). It is
+deliberately dumb — substring, not fuzzy — because family data is small and
+predictability beats cleverness. There is nothing to tune; the only per-app
+decision is *which fields are searchable*.
+
+**1. Declare the searchable fields (pure, testable) in `src/logic.js`:**
+
+```js
+// Everything a user might type to find this item. Include body text and tags,
+// not just the title — that's the whole point of app search.
+export function searchableFields(item) {
+  return [item.title, item.note, ...(item.tags ?? [])];
+}
+```
+
+Fields may be `null`/`undefined` (the matcher ignores them). If a field needs
+data the row doesn't carry (e.g. a category *name* resolved from an id map),
+pass it in as an argument so `searchableFields` stays pure:
+`searchableFields(recipe, categoryNames)`.
+
+**2. Add the search row above your list** (canonical `.search-row` /
+`.search-input` markup is in `src/index.html`) and filter with the matcher:
+
+```js
+import { searchMatch } from "/hub-sdk.js";
+import { searchableFields } from "./logic.js";
+
+const list = searchQ ? items.filter(i => searchMatch(searchQ, searchableFields(i))) : items;
+```
+
+Re-render **only the list** on each keystroke (not the whole view) so the input
+keeps focus. Show a "No items match …" state when the filter empties the list.
+
+**3. Test `searchableFields` in `__tests__/logic.test.mjs`** — assert it matches
+beyond the title (a body/tag/category hit), which is the behavior worth locking
+in. The matcher itself is already unit-tested in the hub; don't re-test it.
+
+```js
+it("is findable by body text, not just title", () => {
+  expect(searchableFields({ title: "Wifi", note: "hunter2" })).toContain("hunter2");
+});
+```
+
 ## Behavioral scenarios (`scenarios.json`)
 
 `logic.test.mjs` unit-tests pure front-end functions; it does **not** exercise
@@ -887,6 +941,14 @@ same restrictions.
 - `retain_days` is a hub-managed **automatic expiry** modifier: the daily
   maintenance runner deletes rows older than `default` days by `timestamp_column`.
   App SQL never gets this power.
+- `steward_writes_only` is a write-lock modifier available on any policy kind:
+  `{ "kind": "adult_writable", "steward_writes_only": true }`. When the app is
+  installed in a **`roster`** shared space (see “Shared spaces & the roster
+  context” below), it restricts all app-originated `INSERT`/`UPDATE`/`DELETE` on
+  the table to the space **steward** (the teacher/organizer); everyone else is
+  read-only. It is **inert in households and non-roster spaces**, so a dual-context
+  app keeps its normal write rules there. Use it for "only the teacher creates X"
+  tables — calendar events, sign-up sheets, announcements.
 
 ### Policy kinds
 
@@ -1155,6 +1217,31 @@ cannot use it to purge rows early. Valid on any policy kind.
 Use it for ephemeral logs, chat history, location pings, and any table with a
 "keep N days" policy. It affects only deletion timing — reads/writes still obey
 the base policy kind.
+
+#### `steward_writes_only` — roster steward-only writes (cross-kind modifier)
+
+```json
+{ "kind": "adult_writable", "steward_writes_only": true }
+```
+
+When the app is installed in a **`roster`** shared space, this locks every
+app-originated `INSERT`/`UPDATE`/`DELETE` on the table to the space **steward**
+(the teacher/coach/organizer — the space's `is_admin` member); all other members
+are read-only. It is a no-op in households and in non-roster spaces, so a
+dual-context app keeps its normal write rules everywhere except a roster. Valid on
+any policy kind, and it composes with the base kind's read model:
+
+- With `owner_or_visibility`, reads *also* collapse to steward-authored rows in a
+  roster (star topology, automatic — see below), so peers never see each other.
+  Reference: **calendar** `events` (`owner_or_visibility` + `write_visibility_scoped`
+  + `steward_writes_only`; households stay fully open, a roster is teacher-only).
+- With `adult_writable`, everyone still reads (so members can see the shared
+  content) while only the steward writes. Reference: **volunteer** `sheets`/`slots`
+  (members claim via a separate `slot_claims` endpoint, so they can still sign up).
+
+Because it keys on the steward, it is one of only two policy features that consume
+the space admin identity — the other being the roster read-collapse. See the
+shared-spaces section below.
 
 #### `owner_only_with_fk_check` — like `owner_only`, but the row references another owned row
 
@@ -1507,6 +1594,61 @@ This catches schema mistakes before install, but does **not** test the
 actual SQL rewriting — when in doubt, check
 `packages/hub/__tests__/unit/cloudflare-row-policy.test.ts` in the hub repo
 for worked examples per policy kind.
+
+### Shared spaces & the `roster` context
+
+Your app runs in one of two **tenant kinds**. The app's SQL is identical in both;
+only how policies resolve differs.
+
+- **`household`** — the default family tenant. Everything above assumes this.
+- **`shared_space`** — a cross-household space, with sub-kinds `general`,
+  `coparenting`, and `roster`.
+
+**Opt in first.** An app is installable in a space **only** if its manifest declares:
+
+```json
+"contexts": ["household", "shared_space"]
+```
+
+Omit `contexts` (or list only `"household"`) and the app is household-only — it
+never appears in a space. This is the single switch that makes an app space-capable.
+
+**The steward.** A space has a steward — its `is_admin` member (the teacher, coach,
+or organizer). The hub maps household "adult" vocabulary onto spaces automatically:
+"adult capability" gates (`adult_writable` writes, `adult_only`) apply to any full
+participant, but **supervision** — the adult read-all / write-all / bypass powers —
+belongs to the **steward alone** in a space (in a space everyone is nominally an
+adult, so "any adult supervises" would mean "everyone," which is wrong). You don't
+code this; it's how role resolution behaves per tenant.
+
+**`roster` = star topology.** A roster (classroom / team / clients) is one steward
+broadcasting to a flat list of members who must not see or reach each other. Two
+behaviors implement it, both **roster-scoped** (inert in households and in
+`general`/`coparenting` spaces):
+
+1. **Read-collapse — automatic, no opt-in.** On an `owner_or_visibility` table, a
+   non-steward's `everyone`/`adult` visibility collapses to **steward-authored rows +
+   their own**, so a member never sees a peer's rows. The steward sees the full
+   roster. You declare nothing extra — it happens because the tenant is a roster. If
+   your app has a table a roster is *meant* to share among members (e.g. a public
+   sign-up list), use `adult_writable`/everyone-read instead, so the collapse doesn't
+   hide it.
+2. **`steward_writes_only` — opt-in modifier** (documented above): locks writes to
+   the steward. This is "only the teacher authors."
+
+**Location defaults OFF in a roster.** If your app consumes location/geofence data,
+note the hub resolves the location `collect` flag to `false` by default in a roster
+space unless the steward turns it on — so don't assume location is being collected.
+
+**Design checklist for a space-capable app:**
+- A table with **no** policy is fully member-read/writable in a roster too — the star
+  topology only governs `owner_or_visibility` reads and `steward_writes_only` writes.
+  Police every table you don't want members freely editing.
+- "Only the steward may do X" → `steward_writes_only` or a server endpoint, never a
+  client `canManage` check.
+- Peer-privacy on `endpoint_only` / `adult_writable` reads is **not** automatic (the
+  collapse is `owner_or_visibility`-only) — hiding who-did-what on those needs
+  deliberate design.
 
 ### Named AI queries (`ai_access`) obey the same row policies
 
@@ -2117,6 +2259,42 @@ Prefer `db_plaintext_columns` when only a few enum/date/lookup columns need to b
 
 **Backward compatibility:** Rows inserted before a column was added to `db_plaintext_columns` have their value stored encrypted. The hub decrypts them correctly on read (it checks each value before decrypting), so old and new rows coexist safely. SQL-level filters and ordering will only work for rows inserted after the column was declared plaintext.
 
+## Household-local dates (`:today`)
+
+Three manifest surfaces let you write a `:today` token into SQL — `agenda`
+sources, `glance` sources, and `kiosk_checklist` filters — and it means the same
+thing in all of them:
+
+> `:today` is the **household's local calendar date** as `yyyy-mm-dd`, resolved
+> from the household's configured timezone and bound as a query parameter.
+
+It is never string-interpolated, and it is never UTC.
+
+That last part matters more than it looks. Your app writes date columns from the
+**user's device clock** — `new Date().getFullYear()/getMonth()/getDate()`, or a
+`<input type="date">` value the user picked while standing in their kitchen. If
+a hub surface compared those against UTC instead, it would stop matching today's
+rows from roughly 6pm onward everywhere in the Americas, and before ~9am east of
+UTC. This is not hypothetical: the kiosk checklist lane shipped with
+`date('now')` on 2026-07-18 and emptied the bedtime-routine tiles every evening,
+which is the one time of day anybody looks at them.
+
+So, when you write date-anchored SQL:
+
+- **Use `:today`** rather than SQLite's `date('now')`, `CURRENT_DATE`, or
+  `datetime('now')`. Those are UTC and will disagree with your own stored rows.
+  (`datetime('now')` is fine for *stamping* a row — it's only comparisons
+  against user-entered dates that break.)
+- **Store the date the user meant.** Build `yyyy-mm-dd` from local getters, not
+  `toISOString().slice(0, 10)` — the latter is UTC and shifts the date for half
+  the day.
+- **Keep the compared column plaintext** (list it in `db_plaintext_columns`).
+  Encrypted columns use a random IV, so `encrypted_col = :today` never matches.
+
+Surfaces that need a *day count* ("12 days until Disney") send the **target
+date** to the client and let the device subtract. That way the number reflows at
+the viewer's own midnight without the hub's cached payloads having to be busted.
+
 ## Today view (`agenda`)
 
 The hub has one chronological **Today** view (a dashboard section plus a `/today`
@@ -2175,6 +2353,143 @@ Apps that already declare a `calendar_events` export don't also need `agenda`
 for those events — the hub merges the export into Today and de-dupes. Use
 `agenda` for non-calendar rows (meals, chores, routines, assignments, etc.).
 
+## Glance widgets (`glance`)
+
+A `glance` is the lightweight tier of homepage widget: one governed read-only
+SELECT plus a display template, rendered natively by the hub (no iframe, no app
+JS). It runs through the same path as `/api/db` — your `row_policies` and column
+decryption apply — and a broken glance is dropped rather than breaking the page.
+
+```json
+{
+  "glance": {
+    "source": {
+      "kind": "sql",
+      "query": "SELECT title AS title, emoji AS emoji, member_id AS member_id, due_date AS at FROM app_myapp__things WHERE done = 0 AND due_date >= :today ORDER BY at LIMIT 3"
+    },
+    "display": {
+      "template": "list",
+      "title": "title",
+      "when": "at",
+      "icon": "emoji",
+      "owner": "member_id"
+    }
+  }
+}
+```
+
+Templates are `stat` (one featured number), `list` (up to 5 rows), and `badge`
+(a count with severity). All column fields name **output aliases** of your
+query, and every one of them is checked against the query at publish time.
+
+`list` supports two fields beyond `title`/`subtitle`/`when`:
+
+- **`icon`** — a per-row emoji column, rendered beside the title.
+- **`owner`** — the owning member's id. This is consumed by *ambient* surfaces
+  only: a kiosk applies its per-device hidden-member list to the rows before
+  rendering, so a screen in a shared room can drop one person's entries. Rows
+  with no owner value are hidden whenever any member is hidden (fail closed).
+  It is **not** a substitute for a row policy — the query still runs under the
+  caller's policy auth.
+
+### Ambient cards (`ambient_card`)
+
+A glance can additionally be promoted to a large, read-from-across-the-room card
+on kiosk screens. Declare it on the glance, not on a separate lane, so the card
+and the homepage widget stay one query:
+
+```json
+{
+  "glance": {
+    "source": { "kind": "sql", "query": "... ORDER BY at LIMIT 3" },
+    "display": { "template": "list", "title": "title", "when": "at", "icon": "emoji", "owner": "member_id" },
+    "ambient_card": "countdown"
+  }
+}
+```
+
+`"countdown"` is currently the only kind. It requires the `list` template and a
+`when` column holding a **`yyyy-mm-dd` target date** — not a day count, not a
+timestamp. The device does the day math against its own clock (see the
+`:today` section above for why). `icon` supplies the glyph; `owner` enables the
+per-device member hiding described above.
+
+The card is still opt-in per device — an admin enables "Count down to upcoming
+dates" on each kiosk — so declaring this only makes your app *eligible*. When
+the card renders, the hub removes your app's ordinary glance tile from that
+screen so the same dates don't appear twice.
+
+## Kiosk checklist (`kiosk_checklist`)
+
+The second PIN-free kiosk lane (alongside `kiosk_quick_add`): a tap-to-complete
+checklist. The only write it can perform is flipping **one existing row** between
+your declared pending and done values — it cannot insert, edit, or delete.
+
+```json
+{
+  "kiosk_checklist": {
+    "table": "run_steps",
+    "label": "Routines",
+    "title_column": "title_snapshot",
+    "icon_column": "icon_snapshot",
+    "sort_column": "sort_order",
+    "member_column": "assigned_member_id",
+    "timer_column": "timer_minutes",
+    "done_by_id_column": "completed_by_member_id",
+    "completed_at_column": "completed_at",
+    "status": { "column": "status", "done_value": "done", "pending_value": "pending" },
+    "parent": {
+      "table": "runs",
+      "fk_column": "run_id",
+      "title_column": "title_snapshot",
+      "filter": [
+        { "column": "status", "equals": "active" },
+        { "column": "run_date", "equals": ":today" }
+      ]
+    },
+    "display": "tiles",
+    "authorization": "avatar",
+    "audit": "member"
+  }
+}
+```
+
+### Fields
+
+- **`table` / `title_column` / `status`** — required. `status.done_value` and
+  `status.pending_value` default to `1`/`0`.
+- **`filter`** (and `parent.filter`) — equality conditions ANDed into both the
+  read and the toggle. `equals: ":today"` binds the household-local date; see
+  the `:today` section. Anchor it on a plaintext column.
+- **`member_column`** — makes the surface per-member. With it, the hub scopes
+  reads and writes to the acting member *in addition to* your row policy.
+- **`parent`** — join one parent row for grouping/filtering (e.g. today's active
+  run). The parent's row policy must be read-open (`adult_writable` with no
+  `member_read_column`/`column_read_acls`, or ungoverned); anything narrower is
+  rejected at publish time rather than failing every tap at runtime.
+- **`display`** — `"list"` (default) or `"tiles"` (full-screen emoji tiles for
+  pre-readers).
+- **`authorization`** — `"ambient"` (no identity; household-wide lists),
+  `"avatar"` (a PIN-free "tap your face" session — the pre-reader path), or
+  `"member"` (a full PIN escalation). An avatar session can never satisfy a
+  `"member"` lane.
+- **`done_by_id_column` / `done_by_name_column` / `completed_at_column`** —
+  stamped on completion, cleared on undo.
+- **`timer_column`** — minutes; renders a per-tile countdown ring.
+- **`audit`** — `"member"` records who tapped; `"none"` disables the write-audit
+  entry.
+
+### Rules
+
+- The lane is **off until an admin opts your app in per device**, and an app
+  with `kiosk: "never"` cannot declare one.
+- Row policies remain the authorization boundary. A per-member table that is
+  `owner_only` fails closed for the ambient identity — that's why an avatar lane
+  shows a "tap your face" rail instead of items, which is the intended flow
+  rather than a limitation to route around.
+- Every referenced table and column is checked against your migrations at
+  publish time.
+
 ## Kiosk quick-add (`kiosk_quick_add`)
 
 Shared-device **kiosk** mode has exactly one PIN-free write lane: a card your app
@@ -2214,8 +2529,19 @@ PIN escalation, the member's) `row_policies`. A row-policied target table fails
 - `actions` (required, 1–2, no duplicates) — `["add"]` and/or `"toggle"`.
   `add` appends a row; `toggle` flips `done_column`.
 - `normalized_column` (optional) — a column you store `lower(trim(text))` into
-  **with a UNIQUE constraint**. When set, adds run `ON CONFLICT DO NOTHING` and a
-  duplicate is *reported*, not errored. Without it, every add inserts.
+  **with a UNIQUE constraint**. When set, adds dedup on conflict instead of
+  erroring. On an **add-only** lane a conflict is a no-op *reported* as a
+  duplicate. On a **toggle** lane, re-adding a value that matches a *completed*
+  row **revives** that row (flips `done_column` back to `0`, clears
+  `done_by_name_column`, refreshes `created_at_column`) so a checked-off item
+  returns to the active list as one clean row — an active duplicate is still a
+  no-op. This is why a toggle lane doesn't need (and shouldn't add) a
+  kiosk-side delete: check off items during use, revive them by re-adding, and
+  prune with a "clear done" action **in the full app** (the kiosk can't clear).
+  Because the whole item lingers until cleared, the UNIQUE index is global; if
+  you'd rather completed items not block re-adds at all, use a partial index
+  (`... WHERE done = 0`) instead — but then a re-add makes a *second* row rather
+  than reviving the first, so prefer the revive behavior above.
 - `done_column` (required when `actions` includes `toggle`) — the integer `0`/`1`
   flag the toggle flips atomically.
 - `done_by_name_column` (optional, requires `done_column`) — stamped with the

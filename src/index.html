@@ -66,6 +66,10 @@
       width: 100%; border: 1.5px solid var(--border-mid); border-radius: 8px;
       padding: 9px 11px; font: inherit; background: var(--surface); color: var(--text);
     }
+    /* Canonical in-app search row — see "Adding search to an app" in CLAUDE.md. */
+    .search-row { margin-bottom: 12px; }
+    .search-input { width: 100%; border: 1.5px solid var(--border-mid); border-radius: 8px; padding: 9px 11px; font: inherit; background: var(--surface); color: var(--text); }
+    .search-input:focus { outline: none; border-color: var(--accent); }
     textarea { min-height: 60px; resize: vertical; }
     input:focus, textarea:focus { outline: none; border-color: var(--accent); }
     .empty, .loading { color: var(--muted); text-align: center; padding: 28px 16px; }
@@ -79,7 +83,7 @@
 </div>
 
 <script type="module">
-import { esc, isAdult } from "/hub-sdk.js";
+import { esc, isAdult, searchMatch } from "/hub-sdk.js";
 
 // --- Hub runtime globals (empty in demo mode) --------------------------------
 const CONTEXT = window.__CONTEXT_URL ?? "";
@@ -91,9 +95,15 @@ let members = [];
 let currentMember = null;
 let items = [];
 let error = "";
+let searchQ = "";
 
 function nowIso() { return new Date().toISOString(); }
 function memberName(id) { return members.find(m => m.id === id)?.name ?? "Someone"; }
+
+// The fields in-app search matches against. Keep it to the text a user would
+// type to find an item — for real apps, move this into src/logic.js and unit
+// test it (see "Adding search to an app" in CLAUDE.md).
+function searchableFields(item) { return [item.title, item.note]; }
 
 // The `items` policy is adult_writable, so only adults may create/edit/delete.
 // Mirror that in the UI exactly — a cosmetic gate that disagrees with the hub
@@ -224,10 +234,21 @@ function render() {
         <button class="btn" type="submit">Add item</button>
       </form>
     ` : `<p class="muted tiny" style="margin-bottom:14px">Only adults can add items.</p>`}
-    <section class="stack">
-      ${items.length ? items.map(renderItem).join("") : `<div class="card empty">No items yet.</div>`}
+    ${items.length ? `
+      <div class="search-row">
+        <input id="search" class="search-input" type="search" placeholder="Search…" aria-label="Search" value="${esc(searchQ)}" />
+      </div>` : ""}
+    <section class="stack" id="list">
+      ${renderList()}
     </section>
   `;
+}
+
+function renderList() {
+  if (!items.length) return `<div class="card empty">No items yet.</div>`;
+  const list = searchQ ? items.filter(i => searchMatch(searchQ, searchableFields(i))) : items;
+  if (!list.length) return `<div class="card empty">No items match "${esc(searchQ)}".</div>`;
+  return list.map(renderItem).join("");
 }
 
 document.addEventListener("click", (event) => {
@@ -241,6 +262,14 @@ document.addEventListener("submit", (event) => {
   if (event.target.id !== "create-form") return;
   event.preventDefault();
   createItem(event.target);
+});
+
+// Re-render only the list on each keystroke so the search box keeps focus.
+document.addEventListener("input", (event) => {
+  if (event.target.id !== "search") return;
+  searchQ = event.target.value;
+  const list = document.getElementById("list");
+  if (list) list.innerHTML = renderList();
 });
 
 refresh();
