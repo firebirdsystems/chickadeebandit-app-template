@@ -16,6 +16,9 @@
     "requires_approval": false
   },
   "storage": "db",
+  "member_references": {
+    "items": { "column": "created_by", "on_removed": "keep" }
+  },
   "row_policies": {
     "items": {
       "kind": "adult_writable"
