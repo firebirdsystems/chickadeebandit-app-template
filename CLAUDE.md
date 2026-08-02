@@ -1808,7 +1808,7 @@ For surveys, polls, and any "one submission per session per member" flow where t
 Declare `anonymous_responses` in `manifest.json`. The hub exposes `POST /run/{appId}/api/submit-response`, which:
 
 1. Resolves the caller's `member_id` from the session (cannot be spoofed)
-2. Checks the session table: rejects if status ≠ `session_open_value`
+2. Checks the session table: rejects if status ≠ `session_open_value`, or if the optional `session_deadline_column` has passed
 3. Checks the receipt table for a duplicate → 409 `already_responded` if found
 4. Inserts the receipt row first (fail-safe: a partial failure always blocks retry)
 5. Inserts one response row per answer, with `member_id` set or omitted based on anonymity
@@ -1835,7 +1835,9 @@ The hub injects `window.__SUBMIT_RESPONSE_URL` for apps that declare this field.
     "session_id_column":          "id",
     "session_status_column":      "status",
     "session_open_value":         "open",
-    "session_anonymous_column":   "anonymous"
+    "session_anonymous_column":   "anonymous",
+    "session_deadline_column":    "closes_at",
+    "result_visible_values":      ["closed"]
   }
 }
 ```
@@ -1843,6 +1845,19 @@ The hub injects `window.__SUBMIT_RESPONSE_URL` for apps that declare this field.
 - Omit `response_member_column` → always anonymous (member_id never stored in response rows)
 - Omit `session_anonymous_column` → same (no per-session toggle)
 - Include both → hub reads the session's `anonymous` column at submission time; non-anonymous sessions store `member_id`, anonymous sessions strip it
+
+### Optional deadline — `session_deadline_column`
+
+A nullable timestamp column on the session table. Once it passes the hub does **both** halves at the same instant, with no cron and nobody having to close anything:
+
+- `POST api/submit-response` → 409 `Response deadline has passed`
+- `GET api/response-results` → releases the results, even though `status` is still open
+
+Requires `result_visible_values` (a deadline with nowhere to release to is decoration). NULL on a session means "no deadline" — the behaviour every existing row already has. `anonymous_ballot` has the identical field.
+
+**A value with no zone suffix is HOUSEHOLD-LOCAL wall time**, which is exactly what `<input type="datetime-local">` produces: store `2026-08-05T20:00` and the hub resolves 8pm in the household's timezone. Do NOT convert it to UTC before storing — that would put the day-boundary in the wrong place for an `agenda` that filters `substr(closes_at, 1, 10) = :today`.
+
+**Mirror the check in your client.** `status` does not change when a deadline passes, so a client that reads `status` alone keeps offering a submit button the hub now rejects. Surveys' `isSurveyOpen()` treats a passed `closes_at` as closed.
 
 ### Schema requirements
 
@@ -2295,6 +2310,89 @@ Surfaces that need a *day count* ("12 days until Disney") send the **target
 date** to the client and let the device subtract. That way the number reflows at
 the viewer's own midnight without the hub's cached payloads having to be busted.
 
+## Coherence checklist (every app, at creation)
+
+The hub reads as one product only when each app plugs into the shared,
+cross-app surfaces. Before an app ships, decide each of these five — declare
+it, or record why it doesn't fit. Silence is treated as unfinished work, not
+as a decision:
+
+1. **`agenda`** — does the app hold anything time-shaped a family should see
+   on Today? (See "Today view" below.)
+2. **`glance`** — is there one number/line worth a home-strip card? (See
+   "Glance widgets" below.)
+3. **`publishes`** — which of the app's state changes matter to *other* apps?
+   Publish catalogued events for them (see "Events API").
+4. **`automation_actions` / `suggested_automations`** — can another app's
+   event usefully write here, or should this app's events drive a starter
+   automation? Suggestions power the post-install "Connect your apps" sheet,
+   so a good one is free onboarding.
+5. **`searchableFields`** in `src/logic.js` — the per-app search convention
+   (see "Adding search to an app").
+
+Coverage is measured: `npm run coverage:apps` in the hub repo
+(`scripts/coverage-report.mjs`) reports every catalog app's declarations, and
+deliberate non-fits belong in `scripts/coverage-na.json` with a one-line
+reason ("no time-shaped data", "anchor columns are encrypted, due-today is
+inexpressible"). An app with an unexcused gap shows up on that report until
+someone either builds the surface or writes the reason down.
+
+## Automation actions (`automation_actions`)
+
+An action is a small declarative write recipe the hub runs on your app's behalf
+when another app's event fires. Your app ships no server code: the dispatcher
+generates the SQL from validated identifiers, and 1–3 ordered steps are allowed
+per action (`lookup`, `insert`, `increment`).
+
+Things that are easy to get wrong:
+
+- **Every `:param` a step references must resolve, or the whole run is skipped**
+  (recorded as `skipped_missing`). That makes an *optional* `member` param
+  unusable in an insert — an unmapped one resolves to nothing and an empty
+  string fails the roster check, so every run would skip. Make member params
+  `required`, or split the recipe into two actions.
+- **Any column compared in SQL must be plaintext.** That covers a `lookup`/
+  `increment` WHERE, the `dedupe` column, and an upsert's conflict columns. At
+  rest, encryption is AES-GCM with a random IV, so an equality against an
+  encrypted column matches nothing — silently and forever.
+- **Give the action a dedupe column** (`source_event_id`, nullable, added in a
+  migration) and write `$event_id` into it. Without it a retry re-applies the
+  event.
+
+Value expressions: `:name`, `-:name`, `$uuid`, `$now`, `$now_plus_days(:name)`,
+`$event_id`, `$normalize(:name)`, or a literal. Use `$now_plus_days` for
+anything with an expiry — a rule is configured once and fires for months, so a
+literal date would expire every row it ever writes on the same day.
+
+**Current-value tables (one row per member) use the upsert form.** `increment`
+only adds to a number, and a plain insert collides after the first write:
+
+```json
+{
+  "op": "insert",
+  "table": "statuses",
+  "values": { "member_id": ":member_id", "status": ":status", "updated_at": "$now" },
+  "on_conflict": { "columns": ["member_id"], "update": ["status", "updated_at"] }
+}
+```
+
+`update` is an explicit list, not "everything in `values`": such a table usually
+holds columns the triggering event knows nothing about (a denormalized display
+name, the member's own note), and an overwrite-all upsert would blank them on
+every run. Columns outside the list keep whatever the row already holds.
+
+`suggested_automations` belong on the **target** app — the hub only surfaces a
+suggestion when the target is installed *and* some installed app publishes the
+trigger event. Check the trigger's real payload before mapping fields: several
+apps publish only `{ title }`, and milestone-style events carry the member in
+`subject_id` rather than the payload (`{ "kind": "subject_id" }`).
+
+The hub does **not** check your action's tables and columns against your
+migrations — a renamed column fails only when a rule fires in a real household.
+Add a test that walks `automation_actions` against `migrations/*.sql` (see the
+`automation_actions match the migrations` block in `tasks`, `calendar`,
+`points-recognition`, `announcements`, or `status-board`).
+
 ## Today view (`agenda`)
 
 The hub has one chronological **Today** view (a dashboard section plus a `/today`
@@ -2332,6 +2430,23 @@ agenda fails to install rather than silently showing nothing):
 - **Day tokens:** `:today` (household-local `yyyy-mm-dd`), `:day_start` /
   `:day_end` (ISO instants bounding the local day). The hub binds them as
   parameters — never string-interpolated.
+- **`:me` — the requesting member's id.** Available in `agenda` and `glance`,
+  bound the same way. **Reach for it only when the row policy genuinely can't
+  answer "is this row mine".** An `owner_only` or `sealed_until` table already
+  scopes its rows to the caller, so `:me` there is redundant. It earns its place
+  on a table scoped to a *pair* or a *party* (`couple_scoped`, `party_scoped`),
+  where the policy correctly shows both people the same rows and only a column
+  comparison says which of them it is addressed to — sea-battle's
+  `WHERE current_turn_id = :me` ("your move", not "a game exists"), love-notes'
+  `WHERE recipient_id = :me AND read_at IS NULL` (without it, the *sender* is
+  told their own note is unread). Compare it against a plaintext member-id
+  column; publish fails otherwise, for the same random-IV reason as day tokens.
+  With no authenticated member (an ambient kiosk identity) `:me` binds SQL NULL,
+  so the comparison matches nothing and the surface renders empty — a wall
+  screen must never inherit one member's private state.
+- **`:me` does not satisfy the day-token filter rule.** An agenda still has to
+  filter on a day token; if your rows aren't dated, the answer is usually a
+  `glance` badge rather than an agenda (see sea-battle, exquisite-corpse).
 - **A day token must actually filter the query** — used in a `WHERE` or
   `JOIN ... ON` comparison (`WHERE plan_date = :today`), not merely selected or
   sorted on. A token that only appears in the SELECT list or `ORDER BY` is
