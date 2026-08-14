@@ -209,6 +209,108 @@ function surfaceErrors(m) {
   }
 }
 
+// ── Validate inline event handlers resolve to globals ─────────────────────────
+// An inline `on*=` attribute is compiled by the browser as a function in GLOBAL
+// scope. Everything declared inside `<script type="module">` is module-scoped,
+// so such a handler only resolves if the name was explicitly assigned onto
+// `window`/`globalThis`. Miss one name out of a bridge block and the app builds,
+// installs, and renders perfectly — then throws
+// `ReferenceError: Can't find variable: x` the first time a user touches that
+// one control. Nothing else in the pipeline can see it: the bundle treats src/
+// as opaque strings, the hub validates the manifest rather than the markup, and
+// logic.test.mjs has no DOM. So it is checked here.
+function inlineHandlerErrors(files) {
+  const errs = [];
+
+  // Names an inline handler may reference without the app declaring them.
+  const AMBIENT = new Set([
+    "event", "this", "window", "document", "console", "navigator", "location", "history",
+    "alert", "confirm", "prompt", "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+    "fetch", "requestAnimationFrame", "queueMicrotask", "structuredClone", "getComputedStyle",
+    "Number", "String", "Boolean", "Array", "Object", "JSON", "Math", "Date", "RegExp",
+    "Map", "Set", "Promise", "Error", "Symbol", "BigInt", "parseInt", "parseFloat",
+    "isNaN", "isFinite", "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
+    // keywords that can precede a `(` and are not calls
+    "if", "for", "while", "switch", "catch", "return", "typeof", "function", "new", "await", "var",
+  ]);
+
+  // `${...}` is evaluated when the template string is built, in module scope —
+  // it is not part of what the browser compiles as a global handler.
+  const stripInterpolations = (s) => {
+    let out = "", i = 0;
+    while (i < s.length) {
+      if (s[i] === "$" && s[i + 1] === "{") {
+        let depth = 1; i += 2;
+        while (i < s.length && depth > 0) {
+          if (s[i] === "{") depth++;
+          else if (s[i] === "}") depth--;
+          i++;
+        }
+        out += "0"; // placeholder for the interpolated value
+      } else out += s[i++];
+    }
+    return out;
+  };
+
+  // A call can't live inside a string literal (`'var(--accent)'` is not a call).
+  const stripStrings = (s) => s.replace(/'[^']*'/g, "''").replace(/`[^`]*`/g, "``");
+
+  // Blank out JS comments so a handler quoted in a comment isn't treated as real
+  // markup. Only whole-line `//` comments, so a `https://` URL survives intact.
+  const stripComments = (js) =>
+    js.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+
+  for (const [name, html] of Object.entries(files)) {
+    if (!name.endsWith(".html")) continue;
+
+    const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+    const classic = scripts.filter(s => !/type\s*=\s*["']module["']/i.test(s[1]));
+
+    // What is actually reachable as a global.
+    const globals = new Set();
+    for (const m of html.matchAll(/\b(?:window|globalThis)\s*\.\s*([A-Za-z_$][\w$]*)\s*=(?!=)/g)) {
+      globals.add(m[1]);
+    }
+    // Top-level declarations in a classic (non-module) script really are globals.
+    for (const s of classic) {
+      for (const m of s[2].matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm)) globals.add(m[1]);
+      for (const m of s[2].matchAll(/^(?:var|let|const)\s+([A-Za-z_$][\w$]*)/gm)) globals.add(m[1]);
+    }
+
+    // Scan handlers in static markup and in rendered template markup alike.
+    let scanned = html;
+    for (const s of scripts) scanned = scanned.replace(s[2], stripComments(s[2]));
+
+    const seen = new Map(); // missing name -> sample handler
+    for (const m of scanned.matchAll(/\son([a-z]+)\s*=\s*(["'`])([\s\S]*?)\2/gi)) {
+      const body = stripStrings(stripInterpolations(m[3]));
+      for (const c of body.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
+        const fn = c[1];
+        if (AMBIENT.has(fn) || globals.has(fn)) continue;
+        if (c.index > 0 && body[c.index - 1] === ".") continue; // method call
+        if (!seen.has(fn)) seen.set(fn, `on${m[1]}="${m[3].trim().slice(0, 60)}"`);
+      }
+    }
+
+    for (const [fn, sample] of seen) {
+      errs.push(
+        `${name}: inline handler calls "${fn}()" but nothing assigns window.${fn} ` +
+        `— it is module-scoped, so this throws ReferenceError at click time (${sample})`
+      );
+    }
+  }
+  return errs;
+}
+
+{
+  const errs = inlineHandlerErrors(files);
+  if (errs.length > 0) {
+    for (const e of errs) console.error(`Error: ${e}`);
+    process.exit(1);
+  }
+  console.log("Inline handlers: all resolve to globals ✓");
+}
+
 // ── Read scenarios.json (optional per-app behavioral specs) ───────────────────
 // Shipped in the bundle so the hub's nightly app-exercise fan-in can replay
 // scenarios against the published bundle (see hub INTEGRATION_TESTS.md).
