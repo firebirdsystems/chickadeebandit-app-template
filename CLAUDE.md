@@ -2074,6 +2074,65 @@ WHERE (r.borrower_id = ? OR r.lender_id = ?)
 
 Reference implementation: `borrowing` app (`migrations/002_agreement_state.sql`, `manifest.json` `agreements` block, `src/index.html` `loadRequests`/`createRequest`/`updateRequest`/`agreeOnServer`).
 
+## External share links — `shareable`
+
+A share link is a time-boxed opaque token (`/share/{token}`) that lets a **non-member** see a hub-rendered page for ONE row of one of your tables. Adults mint links from inside your app via `createShareHelper` from `/hub-sdk.js`; the hub renders the page itself — you write no public HTML.
+
+Resolution **deliberately bypasses row policies**. The manifest declares the entire public projection, so treat every column you list as published to the internet.
+
+```jsonc
+"shareable": {
+  "wall": {                            // logical item type, used when minting
+    "table": "walls",                  // UNPREFIXED
+    "title_column": "title",
+    "columns": [                       // the ENTIRE public column surface
+      { "column": "occasion_date", "label": "When", "format": "date" },
+      { "column": "description", "label": "About", "format": "multiline" }
+    ],
+    "visible_where": { "column": "status", "values": ["open"] },   // plaintext gate on the row
+    "files": { "ids_column": "cover_file_ids", "label": "Photos" }, // JSON array of hub file ids
+    "aggregates": [ /* count | sum | list — collapses child rows to one value */ ]
+  }
+}
+```
+
+Basic read-only sharing is **free**. The premium `sharing` capability raises the link/expiry caps and unlocks passwords plus `submit` (external non-members insert one row into a child table). Never put `sharing` in `required_capabilities` — the gate lives inside the share endpoints.
+
+### `feed` — render child rows as entry cards
+
+An `aggregate` collapses children to a number or a joined string. A **feed** shows them: a guestbook, a comment wall, a photo stream.
+
+```jsonc
+"feed": {
+  "label": "Messages",
+  "table": "posts",                    // UNPREFIXED child table
+  "fk_column": "wall_id",              // references the shared row's id
+  "columns": [
+    { "column": "author_name", "label": "From", "role": "heading" },
+    { "column": "created_at", "label": "Posted", "format": "datetime", "role": "timestamp" },
+    { "column": "body", "label": "Message", "format": "multiline", "role": "body" }
+  ],
+  "files_column": "file_ids",          // per-entry JSON array of file ids; images render inline
+  "where": [                           // ANDed plaintext filters (max 4)
+    { "column": "status", "values": ["published"] },
+    { "column": "visibility", "values": ["everyone"] }
+  ],
+  "parent_where": { "column": "post_visibility", "values": ["everyone"] },
+  "order_column": "created_at",
+  "order": "newest",                   // or "oldest"; default "newest"
+  "max_items": 50,                     // capped at 200
+  "empty_text": "No messages yet."     // omit and an empty feed hides the section
+}
+```
+
+Rules worth knowing before you use it:
+
+- **`role` is presentation only.** `heading`/`timestamp`/`body` drop the label; `detail` (the default) renders `Label: value`.
+- **`where` is how moderation reaches the public page.** Flipping a post's status to `hidden` unpublishes it — and its photos — on the next page load.
+- **`parent_where` gates the WHOLE feed from the shared row.** That is the row's own "visitors may see contributions" switch: when it fails, the item still renders and the child table is never even read.
+- **`where`, `parent_where.column` and `order_column` must be plaintext** (built-in name, `_id`/`_at`/`_date`/`_by` suffix, or listed in `db_plaintext_columns`). SQL cannot filter or sort ciphertext, and the failure would be silent. Projected `columns` are decrypted normally and need no such declaration.
+- **Entry files are capped** at 12 per entry and 100 across the feed; they stream through the same gated `/api/share/{token}/file/{id}` endpoint as the item-level `files` block.
+
 ## Append-only records — `append_only_records`
 
 For immutable history rows, receipts, predictions, audit notes, and other "add a new record, never edit/delete it" data, use `append_only_records` instead of writing the table directly through `/api/db`.
