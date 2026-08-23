@@ -42,7 +42,9 @@ describe("manifest.json", () => {
 
 // ── ai_access SQL file validation ─────────────────────────────────────────────
 // Auto-discovers all db_exports/db_mutations/db_inserts/db_deletes entries and
-// validates each SQL file for type, household_id filter, and single-statement.
+// validates each SQL file for statement type and single-statement (no semicolons,
+// which is exactly what the hub enforces). There is no household_id filter to
+// check — each household is its own D1 database.
 
 if (manifest.ai_access) {
   const ai = manifest.ai_access;
