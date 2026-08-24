@@ -927,8 +927,17 @@ same restrictions.
   normal tables, `status_column` lives on that table. For `inherit_visibility`,
   `sealed_until`, and `owner_only_with_fk_check` child tables, it lives on the
   parent/FK table, so child comments, votes, responses, amendments, and records
-  cannot be changed after the parent locks. The status column must be plaintext:
-  `status` is built in; list custom enum columns in `db_plaintext_columns`.
+  cannot be changed after the parent locks. Any other kind can name the parent
+  explicitly with `"parent_table"` + `"fk_column"` (declared together). The
+  status column must be plaintext: `status` is built in; list custom enum
+  columns in `db_plaintext_columns`. For a stamp column such as `archived_at`,
+  set `"locked_when_not_null": true` instead of (or as well as) `locked_values`
+  — "frozen once set" — rather than storing a sentinel literal in a timestamp
+  column. A parent-frozen INSERT is re-checked inside the D1 transaction and
+  fails with the same 403 policy error as the pre-check if the parent locked
+  mid-flight. A *missing* parent is not frozen — `frozen_when` reads state, it
+  does not check existence; use `owner_only_with_fk_check` when the reference
+  itself must exist.
 - `column_read_acls` is a per-column **read-masking** modifier available on any
   policy kind with an owner column. Each listed column's value is returned as
   `null` unless the caller matches its `visible_to`
