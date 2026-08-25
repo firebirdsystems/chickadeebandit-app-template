@@ -273,6 +273,15 @@ async function loadMembers() {
 function memberName(id) { return memberMap.get(id)?.name ?? "Unknown"; }
 ```
 
+That first `keys=family.members` fetch costs no round trip: the hub embeds the
+roster in the app document (`window.__CONTEXT_PRELOAD`) and answers a GET of
+`__CONTEXT_URL` from it for the first 30 s — the same window the endpoint's
+own browser cache already covered — provided **every** key in the request is
+preloaded (currently `family.members` only). Ask for `family.members` on its
+own; a request that mixes it with another key goes to the network as one
+call. Nothing to change in the app, and `fetch` keeps working exactly as
+before after the window.
+
 ## Parallelizing independent async calls
 
 `loadMembers()` and `loadItems()` are independent — run them in parallel at startup:
@@ -286,6 +295,77 @@ function memberName(id) { return memberMap.get(id)?.name ?? "Unknown"; }
 ```
 
 Side effects like `logActivity`, `notify`, and `/api/activity` are also independent of each other — batch them in a fire-and-forget `Promise.all` after the UI has already updated (see optimistic local state above). Never chain them sequentially with separate `await` calls.
+
+### One request for the first-render reads
+
+Parallel is not free: every `/api/db` request pays the hub's fixed per-request
+cost (session, membership, row-policy rewrite) before the SQL runs, so four
+first-render SELECTs in a `Promise.all` pay it four times. Send them as **one
+batch** — one request, one atomic D1 transaction, results in order:
+
+```js
+import { createDbHelper } from "/hub-sdk.js";
+const db = createDbHelper(window.__DB_URL);
+
+async function loadItems() {
+  const [{ rows: lists }, { rows: items }, { rows: inbox }] = await db.batch([
+    { sql: "SELECT * FROM lists ORDER BY sort_order" },
+    { sql: "SELECT * FROM items WHERE parent_id IS NULL ORDER BY due_date" },
+    { sql: "SELECT * FROM inbox ORDER BY created_at DESC" },
+  ]);
+  …
+}
+```
+
+The raw shape, if you post yourself, is `{ statements: [{ sql, params }, …] }`
+→ `{ results: [{ rows, changed }, …] }` on the same `/api/db` endpoint (max 25
+statements). Each statement is validated and row-policy-rewritten exactly as
+it would be on its own; if any fails, none apply.
+
+### Zero requests for the first-render reads (`manifest.preload`)
+
+Better still: declare the first-render reads in the manifest and the hub runs
+them **while rendering the document**, embeds the rows as `window.__PRELOAD`,
+and answers your matching `/api/db` request from the embedded copy. First
+paint then needs no client round trip at all.
+
+```jsonc
+// manifest.json
+"preload": {
+  "lists": { "sql": "SELECT * FROM app_myapp__lists ORDER BY sort_order" },
+  "mine":  { "sql": "SELECT * FROM app_myapp__items WHERE assignee_id = ? AND due_date <= ?",
+             "params": [":me", ":today"] }
+}
+```
+
+- Each value is **exactly the `{ sql, params }` your code posts** at first
+  render. The hub answers a request whose statement text (whitespace
+  collapsed) and params are equal to a declared entry — so keep the two copies
+  identical, ideally by defining the SQL once (a `LOCAL_READS` constant) and
+  adding a test that the manifest matches it. A drifted copy is not an error;
+  it is a preload that silently never answers.
+- `params` may use `":me"` (the viewer's member id) and `":today"` (the
+  household-local date); the hub resolves them and echoes the resolved values,
+  so your code posts the plain values it always did. Tokens go in `params`,
+  never in the SQL text.
+- Same rules as `/api/db`, enforced at publish: one SELECT/WITH, your own
+  tables only, no comments or trailing `;`, no `endpoint_only` or
+  `steward_reads_only` tables. Up to **6** statements; the inline payload is
+  capped at 256 KB (over it, the whole preload is dropped and your fetches run
+  as usual).
+- **Each entry answers ONE request**, and any `/api/db` POST the preload does
+  not answer (a write, a mixed batch) discards every remaining entry. A re-read
+  after a write, a poll, a refresh — all go to the network exactly as before.
+  Only the request the document was rendered for changes.
+- A `db.batch([...])` is answered too, when **every** statement in it is
+  preloaded (in order). A batch that mixes in a non-preloaded statement goes
+  to the network whole, never split — so your first-render batch keeps
+  working with or without the preload.
+- Only member sessions are preloaded (an anonymous visitor or ambient kiosk
+  identity is not), so your code must still fetch — the preload is an
+  accelerator, not a data source. An app that wants to render before its
+  module evaluates may read `window.__PRELOAD.lists.rows` directly and fall
+  back to a fetch when the key is absent.
 
 ## Modal pattern
 
