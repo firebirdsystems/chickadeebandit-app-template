@@ -3033,6 +3033,25 @@ Two SQLite realities to plan for:
   existed. Numeric allow-lists (`CHECK (flag IN (0,1))`) are safe — numbers are
   the one shape the codec never encrypts. For a string enum, add the column to
   `db_plaintext_columns`.
+- **A string literal a migration WRITES into an encrypted column is stored
+  plaintext.** Migrations run outside the app-db codec, so
+  `INSERT … VALUES ('seed', 'Automations')`, `UPDATE … SET note = '[]'` and
+  `kind TEXT DEFAULT 'meeting'` all land in the clear, while every runtime write
+  of the same column stores ciphertext — the column then holds both encodings
+  and nothing reports it. The hub lints for this at publish time. Legal:
+  column-to-column copies (including via subquery), numeric literals, `''`, a
+  literal that only chooses the row (a subquery's `WHERE`, a `CASE WHEN …`
+  condition), and `DEFAULT ''` / `DEFAULT '[]'` / `DEFAULT '{}'`. To keep a
+  knowingly-plaintext value (a seed row, a sentinel), annotate the migration
+  with a reason — the annotation is scoped to that migration file:
+
+  ```sql
+  -- cb:plaintext-literal <table>.<column> — why this value is knowingly plaintext
+  ```
+
+  The bare `<column>` form is accepted but covers ONE table; if the same column
+  name takes a literal on two tables in one migration, qualify both. A
+  low-entropy enum or colour is usually better off in `db_plaintext_columns`.
 
 **SQL file rules (enforced by hub at runtime and tested by CI):**
 - Must start with `INSERT`
