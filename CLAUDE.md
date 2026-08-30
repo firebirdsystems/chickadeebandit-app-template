@@ -944,6 +944,33 @@ The hub validates and rejects any migration that contains:
 - `CREATE TABLE` without `IF NOT EXISTS`
 - Any `CREATE`/`DROP`/`ALTER TABLE|INDEX|VIEW|TRIGGER` whose target table name doesn't start with your app's `app_{appId}__` prefix
 
+**Put comments ABOVE the statement they describe — never after the last one.**
+The runner splits each migration file on top-level `;` and applies the pieces one
+at a time, so whatever trails the final semicolon becomes a statement of its own.
+A closing footnote is therefore a comment-only "statement", and D1 answers a
+statement with nothing executable in it with `The supplied SQL string contains no
+statements`. That used to abort the whole install — and because a migration's
+version is recorded only after *every* statement in the file succeeds, the retry
+failed identically forever and the app could never be installed. The runner now
+skips such a fragment, but it still counts against the per-bundle statement
+budget, and relying on that leniency means relying on which hub version you land
+on. A statement may *begin* with comments (every example here does); a file must
+not *end* with them.
+
+```sql
+-- Good: the note explains the index it sits above.
+CREATE INDEX IF NOT EXISTS app_myapp__items_created_idx
+  ON app_myapp__items (created_at);
+```
+
+```sql
+CREATE INDEX IF NOT EXISTS app_myapp__items_created_idx
+  ON app_myapp__items (created_at);
+
+-- Bad: everything after the last `;` is parsed as its own statement.
+-- Move this above the CREATE INDEX.
+```
+
 Row-level access restrictions are **not** expressed in SQL (no `CREATE POLICY`/RLS) —
 declare them as `row_policies` in `manifest.json` instead; see "Row-level access control"
 below. Anything not declared there is fully readable/writable by any household member
