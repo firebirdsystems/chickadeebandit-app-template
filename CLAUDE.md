@@ -277,10 +277,34 @@ That first `keys=family.members` fetch costs no round trip: the hub embeds the
 roster in the app document (`window.__CONTEXT_PRELOAD`) and answers a GET of
 `__CONTEXT_URL` from it for the first 30 s — the same window the endpoint's
 own browser cache already covered — provided **every** key in the request is
-preloaded (currently `family.members` only). Ask for `family.members` on its
-own; a request that mixes it with another key goes to the network as one
-call. Nothing to change in the app, and `fetch` keeps working exactly as
+preloaded (currently `family.members` and `family.app_members`). A request
+that mixes a preloaded key with a non-preloaded one goes to the network as
+one call. Nothing to change in the app, and `fetch` keeps working exactly as
 before after the window.
+
+## Who is playing vs. who lives here
+
+`family.members` is the whole household roster. A household can narrow an
+app's audience (`visible_to`, per-member grants/restrictions, `min_age`,
+`default_audience`) without the app hearing about it, so any "has everyone
+done this?" computed against the roster can be unreachable forever.
+
+Declare `"family.app_members"` in `data_access.reads` when you need the
+participant set: same shape as `family.members`, filtered to the members the
+hub would actually let into *your* app. Use it **only** for completeness
+("everyone has answered/drawn/voted"); keep `family.members` for naming
+people ("drawn by Dana", pickers, rosters) — departed-but-referenced and
+restricted members still need names. Admins always appear in
+`family.app_members` (the hub always lets them in, even past `visible_to`).
+Fall back when the key is absent (older hub) or empty (failed fetch):
+
+```js
+const res = await fetch(`${CONTEXT}?keys=family.members,family.app_members`);
+const json = await res.json();
+members    = json["family.members"] ?? [];
+appMembers = json["family.app_members"] ?? null;  // null = unknown, use members
+// completeness: (appMembers ?? members)   naming: members
+```
 
 ## Parallelizing independent async calls
 
