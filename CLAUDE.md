@@ -3004,8 +3004,29 @@ Each name maps to `src/queries/{name}.sql`. The build script includes everything
   queries (`ai_access`) obey the same row policies" above. A `JOIN` is fine
   against ungoverned tables (the example below) but fails closed against a
   governed one
-- SQLite, not Postgres: **`NULLS LAST` is not supported**. Sort nulls last with a
-  leading `(col IS NULL)` term
+- **The hub's SQL grammar is narrower than SQLite's.** The hub parses every
+  statement with its own parser (node-sql-parser) before executing it, and that
+  parser rejects some perfectly valid SQLite. A statement that only SQLite
+  accepts dies at runtime with `Could not parse SQL`, even though it prepares
+  fine locally. Known-rejected constructs — avoid all of these in `queries/*.sql`,
+  `manifest.preload`, and every statement your app posts to `/api/db`:
+  - `NULLS LAST` — sort nulls last with a leading `(col IS NULL)` term instead
+  - `CROSS JOIN ... ON` — use `JOIN ... ON` or a comma join
+  - Window functions (`OVER (...)`)
+  - `FILTER (WHERE ...)` on aggregates — use `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`
+  - `EXCEPT` (and bare `VALUES` lists as statements)
+  - `IS NOT DISTINCT FROM` — spell out the null-safe comparison
+  - `INDEXED BY`
+  - Reserved words as column aliases: `COUNT(*) AS count` is rejected — pick a
+    name like `AS total` or `AS vote_count`
+
+  Safely inside the accepted subset: comma joins, `LEFT JOIN`, CTEs
+  (`WITH ... SELECT`), `UNION ALL`, correlated subqueries, subqueries in `FROM`,
+  `CASE` (including in `ORDER BY`), `GROUP BY`/`HAVING`, `json_extract`, `IIF()`,
+  `LIMIT`/`OFFSET`. The contract gate runs your declared reads through the hub's
+  actual parser, so a rejected construct fails your release rather than
+  production — but SQL your app posts at runtime is only checked at runtime,
+  so stay inside the subset there too
 
 Example (`src/queries/open_tasks.sql`) — the real file from the `tasks` app:
 
