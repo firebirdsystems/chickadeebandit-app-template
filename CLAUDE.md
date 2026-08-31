@@ -54,7 +54,7 @@ under Security constraints.
 Import shared utilities from `/hub-sdk.js`:
 
 ```js
-import { memberColor, initial, esc, isAdult, hubConfirm, hubAlert, formatRelativeDate, fmtMoney, fmtMoneyShort } from "/hub-sdk.js";
+import { memberColor, initial, esc, isAdult, hubConfirm, hubAlert, hubToday, formatRelativeDate, fmtMoney, fmtMoneyShort } from "/hub-sdk.js";
 ```
 
 - `memberColor(memberId, members)` — deterministic color string for a member's avatar
@@ -63,11 +63,37 @@ import { memberColor, initial, esc, isAdult, hubConfirm, hubAlert, formatRelativ
 - `isAdult(member, members)` — returns true if the member has role "adult"
 - `hubConfirm({ message, description?, confirmLabel?, destructive? })` — async confirm dialog; returns true/false
 - `hubAlert(message, { description?, confirmLabel? })` — async single-button notification dialog. **Always use this instead of `alert()`.** A raw `alert()` fires the browser's native dialog, which inside the hub iframe renders as an "an embedded page at …app… says" popup with stripped-down chrome — confusing and off-brand. `hubAlert` posts to the parent hub frame, which renders the message in the hub's own themed dialog. Same idea for confirmations: use `hubConfirm`, never `confirm()`.
+- `hubToday(now?)` — today as `"yyyy-mm-dd"` on the **household's** calendar, the same day the hub binds to `:today` in your declared SQL. Pass an instant to ask which household-day it fell on. Falls back to the device's calendar when the hub published no zone.
 - `fmtMoney(cents)` — format integer cents as USD with no decimals: `fmtMoney(125000)` → `"$1,250"`. Returns `"—"` for null.
 - `fmtMoneyShort(cents)` — compact format for large amounts: `$450K`, `$1.3M`. Use for summary displays.
 - `createStreamHelper(streamUrl, eventType, callback)` — opens an SSE connection to `window.__STREAM_URL` and calls `callback(event)` for each event. Auto-reconnects on close. Returns `{ connect(), disconnect() }`. Pass `null` as `eventType` to receive all event types.
 
 Always use `esc()` when rendering user-provided strings into HTML templates.
+
+### Dates: `hubToday()`, never `toISOString().slice(0, 10)`
+
+`new Date().toISOString().slice(0, 10)` is **UTC**. It names yesterday for the
+whole evening west of Greenwich and tomorrow late at night east of it. It is the
+single most common date bug in these apps.
+
+The rule:
+
+- **A date you STORE or COMPARE → `hubToday()`** (client) or `:today` (SQL).
+  Those name the same day, so a row your UI writes and a row the glance, kiosk,
+  cron, or an MCP export reads agree. A wrong stored date never heals: the row
+  says one day and every server-side surface says another.
+- **Rendering an INSTANT** — clock times, "3h ago" — stays on the device clock.
+  That is what a reader expects to see, and it is what `formatRelativeDate` does.
+
+Two more traps in the same family:
+
+- `new Date("2026-08-30")` parses as UTC **midnight**, so formatting it for
+  display shows Aug 29 west of Greenwich. Build the Date from parts instead:
+  `new Date(y, m - 1, d)`.
+- A bare `"yyyy-mm-dd"` column compared against `datetime('now')` is a *lexical*
+  compare in which `"2026-08-30"` sorts BEFORE `"2026-08-30 14:22:00"` — so
+  "expires on the 30th" silently drops the whole of the 30th. Compare a date to
+  a date: `WHERE expires_at >= :today`.
 
 ### Updating hub-sdk.js
 
