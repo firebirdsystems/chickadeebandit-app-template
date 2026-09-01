@@ -416,6 +416,19 @@ paint then needs no client round trip at all.
   accelerator, not a data source. An app that wants to render before its
   module evaluates may read `window.__PRELOAD.lists.rows` directly and fall
   back to a fetch when the key is absent.
+- **Bound every preloaded read.** These run on every launch for every
+  household, and D1 bills rows read, so an unbounded `SELECT *` over a table
+  that grows with time gets slower and costlier for your heaviest users. Give
+  each statement a WHERE that says what the first screen actually needs — a
+  recent window (`created_at >= date(?, '-120 days')` with `":today"`, never
+  `date('now')`, which is UTC), the open/unarchived rows, this member's rows —
+  or, failing that, a LIMIT with a deterministic tiebreak so the page doesn't
+  reshuffle between loads. A table that only grows with the roster or with
+  hand-entered setup (categories, templates, profiles) is honestly read whole;
+  one that grows with use is not. Where the first screen needs none of a
+  table's rows, leave it out of `preload` entirely and fetch it when the user
+  opens the thing that needs it. Bounding a statement makes it index-eligible,
+  so add the matching index in the same change.
 
 ## Modal pattern
 

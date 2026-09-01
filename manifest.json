@@ -17,7 +17,7 @@
   },
   "storage": "db",
   "preload": {
-    "items": {"sql": "SELECT * FROM app_app_template__items ORDER BY created_at DESC"}
+    "items": {"sql": "SELECT * FROM app_app_template__items ORDER BY created_at DESC, id DESC LIMIT 200"}
   },
   "member_references": {
     "items": { "column": "created_by", "on_removed": "keep" }

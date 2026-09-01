@@ -144,7 +144,14 @@ async function loadItems() {
     ];
     return;
   }
-  const { rows } = await db("SELECT * FROM app_app_template__items ORDER BY created_at DESC");
+  // Bounded on purpose. This statement is also declared in manifest.preload,
+  // which the hub runs server-side on EVERY app launch, for every household —
+  // and D1 bills rows read. An unbounded `SELECT *` reads the whole table each
+  // time, so it gets slower and more expensive for exactly the households that
+  // use the app most. Copy the habit: give every preloaded read a WHERE that
+  // says what the first screen needs, or a LIMIT with a deterministic tiebreak
+  // (`id DESC` here) so the page doesn't reshuffle between loads.
+  const { rows } = await db("SELECT * FROM app_app_template__items ORDER BY created_at DESC, id DESC LIMIT 200");
   items = rows;
 }
 
