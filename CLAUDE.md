@@ -692,6 +692,146 @@ Hub documents are automatically deleted when the app is uninstalled. Storage usa
 const uploadHtml = window.__DOCS_URL ? `<div class="upload-area">…</div>` : "";
 ```
 
+## File lifecycle — reclaiming orphaned bytes
+
+`files.upload()` puts bytes in hub storage and hands you an id. Nothing in the
+platform knows that a column in your table *means* "a hub file id" unless you say
+so. If you do not declare it, every row you delete and every attachment you
+replace strands its bytes: billed forever, named by nothing, unreachable.
+
+The rule: **any column that holds a hub file id must be declared in one of the
+file-lifecycle keys.** Do not reclaim from the client. A trailing
+`files.delete(id)` after the write is best-effort, unretried, and lost to a
+closed tab — the row is already gone, so nothing can name the leak afterwards.
+
+There are four keys, split along two axes — *what happened to the row* (deleted
+vs. updated) and *how the column stores ids* (one id vs. a JSON array):
+
+|  | scalar column (one id) | JSON-array column (many ids) |
+|---|---|---|
+| **row is DELETEd** | `delete_file_columns` | `delete_file_list_columns` |
+| **row survives, column reassigned** | `update_file_columns` | `update_file_list_columns` |
+
+All four are keyed by **unprefixed** table name and valued by an array of column
+names:
+
+```jsonc
+"delete_file_columns":      { "items":  ["receipt_file_id"] },
+"delete_file_list_columns": { "plants": ["photo_file_ids"] },
+"update_file_columns":      { "gardens": ["plan_file_id"] },
+"update_file_list_columns": { "plants":  ["photo_file_ids"] }
+```
+
+A column usually needs **both** lanes. `plants.photo_file_ids` above appears in
+`delete_file_list_columns` *and* `update_file_list_columns`, because a gallery
+loses bytes two different ways: the plant is deleted, or one photo is removed
+from a plant that lives on. Declaring only the delete lane leaks every replaced
+avatar; declaring only the update lane leaks every deleted row.
+
+**Scalar columns must be plaintext; list columns need not be.** The reclaim reads
+a scalar file column in raw SQL, before the household codec runs — so a column in
+`delete_file_columns` or `update_file_columns` must be named so it is never
+encrypted (an `_id` suffix does this; see "What is already plaintext") or listed
+in `db_plaintext_columns`. List columns are decoded *through* the codec and may
+be encrypted at rest. This is the only reason the two are separate keys rather
+than one.
+
+**How it actually runs.** The engine reads the doomed ids out of the affected
+rows *before* the write, and puts a deletion intent into the **same transactional
+batch** as your statement. The outbox consumer then re-derives "is this id still
+referenced?" from the **committed** database before it touches storage — so an id
+that merely moved between rows, was retained by the UPDATE expression, or is
+shared by a second row is never destroyed. You cannot leak by declaring too much.
+
+It is also cheap when it does not apply: an UPDATE that never assigns a declared
+column (renaming a plant, toggling a switch) returns before any read happens.
+
+**The other three reclaim paths already exist** — declare file columns there too,
+and the hub treats all of them as one ownership graph:
+
+| Path | Key |
+|---|---|
+| a parent's children are cascade-deleted | `delete_cascades[].file_id_column` |
+| a row expires | `row_policies.<t>.retain_days.file_id_column` / `retention.<t>.file_id_column` |
+| a member leaves the household | `member_references.<t>.file_id_column` / `.file_id_list_column` |
+
+Omitting a column from *any* of these is not a local mistake. The retention sweep
+asks the whole manifest "does anything still name this object?" before it
+destroys bytes — a column you left undeclared makes the answer wrong, and the
+sweep can destroy an object a live row still points at.
+
+### Checklist for any app that uploads files
+
+- [ ] Every file-id column appears in a delete lane (`delete_file_columns` or `delete_file_list_columns`), or is covered by `delete_cascades[].file_id_column` on its parent.
+- [ ] Every file-id column a user can *replace* also appears in the matching update lane.
+- [ ] Scalar file columns are plaintext (`_id` suffix, or `db_plaintext_columns`).
+- [ ] No `files.delete()` call in client code exists purely to clean up after a DB write. (Deleting a file the user explicitly removed *before* any row references it is fine.)
+- [ ] If rows expire or reference members, `retain_days.file_id_column` / `member_references.file_id_column` name the same columns.
+
+## File and document access control
+
+Raw file bytes (`/api/files`) and hub document records (`/api/documents`) live
+**outside** your app's D1 tables, so `row_policies` do not reach them. A file
+referenced only by an `owner_only` row is still listable and downloadable by
+every household member unless you say otherwise. Two manifest keys close that.
+
+### `file_acls` — who may upload, and who may read the bytes
+
+```jsonc
+"file_acls": {
+  "write": { "require_role": "adult" },
+  "read":  "document_acl"
+}
+```
+
+`write` accepts any combination of (all must be satisfied):
+
+| Field | Effect |
+|---|---|
+| `require_role: "adult"` | only adults may upload or delete |
+| `require_group_setting` | `{ settings_table, settings_key }` — caller must be a household admin or a member of the group whose id your app stores at that settings row |
+| `roster_steward_only` | in a `roster` shared space, only the space steward may upload or delete. No-op in households and non-roster spaces |
+| `steward_household_only` | once any steward household is seated (a co-parenting space), only a current steward may upload — and **nobody** may delete bytes through `/api/files` at all. Bytes then leave only by retention or a countersigned `file_purge`. No-op in an ordinary household |
+
+`read` is a single mode, not an object:
+
+| Mode | Meaning |
+|---|---|
+| *(omitted)* | any household member may read and list the app's files |
+| `"uploader_only"` | private to the uploading member — read, list and delete deny everyone else, **hub admins included**. Use when the rows are `owner_only` with `adults_bypass: false` |
+| `"document_acl"` | the file inherits the access rules of the `family.documents` record that links it via `file_key`. Without this, a document restricted to one member is metadata-only privacy — the bytes stay downloadable by everyone. A file no document references yet falls back to uploader-only; hub admins bypass, matching the document read path |
+| `"couple_scoped"` | readable by the uploader and that uploader's current reciprocal partner, resolved through the app's own `partner_link` table (so it **requires** `manifest.partner_link`). No admin or adult bypass; only the uploader may delete. Residual and deliberate: the file table carries no partner session, so re-pairing exposes a member's own earlier uploads to a new partner |
+
+### `document_acls` — who may mutate hub document records
+
+```jsonc
+"document_acls": { "write": { "require_role": "adult" } }
+```
+
+Governs `/api/documents` (create, edit, delete). Fields: `require_role: "adult"`
+and `roster_steward_only`. For an app that stores bytes in `/api/files` and
+metadata in `family.documents` (like `docs`), set the matching lock on **both**
+keys — otherwise the record is steward-managed and the bytes are not.
+
+### `file_purge` — countersigned early destruction
+
+For `versioned_records` whose bytes must be destroyed *before* their retention
+window closes, and only by mutual agreement:
+
+```jsonc
+"file_purge": {
+  "records": {
+    "agreement_table":   "purge_agreements",
+    "record_id_column":  "record_id",
+    "versioned_record":  "records"
+  }
+}
+```
+
+The bytes go when the named agreement locks. Under a co-parenting space's
+`party_mode: "steward_households"`, that makes destruction bilateral — neither
+parent can unilaterally erase a record. Reference app: `family-records`.
+
 ## Cross-app data sharing
 
 Apps can read and write each other's KV store data. Both sides must declare intent in their manifests; the hub enforces both at runtime.
@@ -1603,6 +1743,28 @@ they reference via foreign key:
   `privileged_groups`/adult-bypass, for that action) are unrestricted (e.g.
   cascade-delete when the parent is deleted); everyone else is restricted to
   rows where `writer_column = <caller>`.
+  **Which callers count as privileged depends on the PARENT's kind, and the two
+  differ.** Under an `owner_only`/`owner_only_with_fk_check` parent, an adult
+  (steward in a space) is already privileged unless that parent set
+  `adults_bypass: false`. Under an `owner_or_visibility` parent, privilege means
+  `privileged_groups` membership *only* — adults get nothing — so with no group
+  configured the writer restriction is absolute.
+- Add `"adults_bypass": true` to let adults (steward in a space)
+  `UPDATE`/`DELETE` any child row **whose parent they can see**. Without it,
+  under an `owner_or_visibility` parent, a row can be corrected by nobody but
+  its writer: a stray line item on a shared record cannot be removed except by
+  deleting the whole parent, a completion can only be retracted by whoever
+  entered it, and — because `member_references` keeps the writer id when a
+  member leaves — such rows freeze permanently once that member is off the
+  roster. **Its default is `false`, the opposite of `owner_only`'s
+  `adults_bypass` (which is on unless you set it to `false`).** That is
+  deliberate, not an inconsistency to tidy up: writer-only is what every app
+  written before this flag relies on, so the default had to be the one that
+  changes nothing. It never widens *which parents* a caller can reach — the
+  parent-visibility check still applies — and it has no effect in a coparenting
+  space (both parents are stewards there) or, for now, a general space. Leave it
+  off where writer-only is the guarantee your app advertises: sealed responses,
+  attributed votes, per-member logs.
 - Add `"insert_privileged_only": true` to block `INSERT` for everyone except
   the privileged group inherited from the parent policy's `privileged_groups`
   (entries covering `"insert"`). Returns 403 for all other callers. Useful when
@@ -2454,11 +2616,17 @@ The hub encrypts most string columns at rest before writing them to the database
 The hub skips encryption automatically for:
 
 - Columns whose name ends in `_id` — foreign keys and member references
-- Columns whose name ends in `_at` — timestamps (`created_at`, `updated_at`, etc.)
+- Columns whose name ends in `_at` — timestamps (`created_at`, `updated_at`, …)
+- Columns whose name ends in `_date` — calendar dates (`start_date`, `due_date`)
+- Columns whose name ends in `_time` — clock times (`start_time`, `end_time`)
 - Columns whose name ends in `_by` — actor columns (`created_by`, `done_by`)
-- A fixed set of well-known columns: `id`, `household_id`, `completed`, `all_day`, `status`, `type`, `category`, `week`, `emoji`, `icon`, `position`, `sort_order`, `pinned`, `key`, `version`
+- A fixed set of well-known columns: `id`, `household_id`, `created_at`, `updated_at`, `sent_at`, `read_at`, `expires_at`, `last_synced_at`, `completed`, `all_day`, `status`, `type`, `category`, `week`, `emoji`, `icon`, `source`, `position`, `sort_order`, `pinned`, `key`, `version`, `visibility`, `audience`, `membership_type`, `membership_roles`
 
 These columns can be safely used in `WHERE` filters and `ORDER BY` clauses in SQL.
+
+Note the suffix is exact and singular: `_time` matches `start_time` but **not**
+`reminder_times`, which holds a JSON array rather than one clock value and stays
+encrypted unless you declare it.
 
 ### The problem with encrypted columns
 
@@ -3188,3 +3356,351 @@ Two SQLite realities to plan for:
 - A hub admin can set `disabled: true` via `PATCH /api/apps/{id}/ai-access` to block MCP access for any app regardless of its manifest
 - Admins cannot *enable* AI access for an app that declared `allowed: false` — only the manifest can grant it
 - Consider whether your app contains sensitive content before enabling `ai_access`. Couples apps, therapy journals, and similar private apps should leave `allowed: false`
+
+---
+
+## Cascading deletes (`delete_cascades`)
+
+When app SQL deletes a parent row, its children are not deleted with it unless
+the schema declares a real `ON DELETE CASCADE` foreign key or the manifest
+declares `delete_cascades`. Stranded children are worse than untidy:
+`inherit_visibility` children go **invisible** to every reader once the parent's
+`EXISTS` check fails, and `endpoint_writes_only` / `endpoint_only` children
+cannot be deleted by any app SQL at all — invisible, undeletable, billed residue.
+
+Keyed by **unprefixed parent table**, valued by a non-empty array of dependents:
+
+```jsonc
+"delete_cascades": {
+  "pets": [
+    { "table": "activities", "foreign_key": "pet_id" },
+    { "table": "logs",       "foreign_key": "pet_id" }
+  ],
+  "activities": [
+    { "table": "logs", "foreign_key": "activity_id" }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `table` | yes | unprefixed child table |
+| `foreign_key` | yes | child column pointing at the parent's `id` |
+| `file_id_column` | no | string or array — child columns holding hub file ids, reclaimed with the child rows |
+
+Rules and gotchas:
+
+- The parent **must have an `id` column** — that is the column every child FK points at.
+- Cascades are declared per level and are **not transitive by inference**. Deleting a pet does not delete its activities' logs through the `activities` entry; that is why `pets` lists `logs` directly as well.
+- The engine deletes children as trusted SQL inside the parent DELETE's transactional batch. Authority derives **entirely** from the parent delete, which the parent's own row policy still fully gates — a cascade never widens who may delete what.
+- **Prefer a real `ON DELETE CASCADE` FK** where your schema can declare one. `delete_cascades` is the retrofit path (and the file-reclaim path) for tables that cannot.
+- Declare `file_id_column` on any child that owns bytes, or the cascade deletes the rows and leaks their files.
+
+## Hub-managed expiry for ungoverned tables (`retention`)
+
+`row_policies.<table>.retain_days` gives a *governed* table an expiry. `retention`
+is the identical shape and the identical runner for a table that has **no row
+policy** — a pet's feeding log, a plant's watering log: correctly ungoverned
+because any member may write it, but still growing several rows a day forever.
+
+```jsonc
+"retention": {
+  "logs": { "default": 180, "timestamp_column": "done_at" }
+}
+```
+
+A table uses `retain_days` **or** `retention`, never both. Fields beyond
+`default` (max 3650) and `timestamp_column`: `id_column`, `override_key`,
+`tier` (`evidentiary` | `operational` | `transient`), `file_id_column`,
+`exempt_when: { column, values }`, `dependent_tables`, `fold`. See the
+`retain_days` section under "Row-level access control" for the full semantics —
+they are the same field.
+
+## Endpoint ACL keys
+
+`row_policies` govern rows in your app's D1 tables. They do **not** reach the hub
+endpoints your app also calls. Each of those has its own manifest key, and each
+defaults to "any household member" if you omit it.
+
+| Key | Guards | Shape |
+|---|---|---|
+| `store_acls` | `/run/{app}/api/store` reads and writes, **per key** | `{ "<key>": { "read": rule, "write": rule } }` |
+| `notification_acls` | `/run/{app}/api/notifications/send` | `{ "send": { "require_group_setting": {...} } }` |
+| `publish_acls` | `/run/{app}/api/events`, **per event type** | `{ "<event>": { "require_role", "require_group_setting" } }` |
+| `export_acls` | cross-app writes (`/api/cross-write`), **per export key** | `{ "<key>": { "require_group_setting": {...} } }` |
+| `file_acls` | `/api/files` | see "File and document access control" |
+| `document_acls` | `/api/documents` | see "File and document access control" |
+
+The two rule primitives, which may be combined (both must pass):
+
+- `require_role` — `"adult"` (all keys), or `"member"` (`publish_acls` only: any authenticated household member).
+- `require_group_setting: { settings_table, settings_key }` — the caller must be a household admin **or** a member of the group whose id your app stores at that settings row. This is the "only the configured Board/committee" gate.
+
+```jsonc
+"store_acls":        { "calendar_events": { "write": { "require_role": "adult" } } },
+"notification_acls": { "send": { "require_group_setting": { "settings_table": "settings", "settings_key": "moderator_group_id" } } }
+```
+
+**`store_acls` is not optional for sensitive projections.** Store exports live
+outside your D1 tables, so a KV key holding a projection of governed rows is
+readable by every member unless a `read` rule says otherwise. If a governed
+table is `adult_only` and you mirror it into the store for another app, mirror
+the gate too.
+
+**`publish_acls` matters more than it looks.** An event listed in `alert_on`
+materializes a bell entry for the household, and — the real reason — publishing
+runs any household automation wired to that event, whose `insert` / `increment`
+steps the hub executes as trusted scoped SQL that **bypasses row policies**. The
+publish ACL is the only authorization standing in front of that path. Reach for
+it whenever an event asserts that a privileged action happened. Gating the table
+and the push notification while leaving the event bus open to any adult is a
+real, shipped bug class.
+
+## The event bus (`publishes`, `alert_on`, `subscribes_to`)
+
+Three parallel arrays of event-type strings:
+
+```jsonc
+"publishes":     ["leaderboard.match_recorded"],
+"alert_on":      ["leaderboard.match_recorded"],
+"subscribes_to": ["game.completed"]
+```
+
+- `publishes` — event types this app emits. Declaring it does nothing on its own; the app must actually `POST /run/{app}/api/events`.
+- `alert_on` — a **subset of `publishes`** that lights the household notification bell.
+- `subscribes_to` — event types this app consumes. Same rule: declaring it does not wire anything, it authorizes the app to receive them.
+
+Use event types from the shared catalog (`event-catalog.json`, served at the
+hub's `/event-catalog.json`) so publishers and subscribers agree. An
+uncatalogued type is permitted but nothing else will listen for it. Gate emission
+with `publish_acls` when the event asserts something privileged.
+
+## Weekly digest contribution (`digest`)
+
+A declarative contribution to the hub's scheduled weekly digest email, for apps
+whose model is "recurring activity, last done at T, due every N". No app code —
+the hub composes the query.
+
+```jsonc
+"digest": {
+  "kind": "recurring_due",
+  "activity_table": "activities",
+  "activity_label_column": "name",
+  "activity_icon_column": "icon",
+  "interval_column": "interval_hours",
+  "interval_unit": "hours",
+  "default_interval": 24,
+  "parent":    { "table": "pets", "activity_fk_column": "pet_id", "parent_label_column": "name" },
+  "last_done": { "table": "logs", "activity_fk_column": "activity_id", "timestamp_column": "done_at" },
+  "filters":   [{ "column": "schedule_type", "equals": "interval" }],
+  "alert_days": 3
+}
+```
+
+`kind` is always `"recurring_due"`. Required: `kind`, `activity_table`,
+`activity_label_column`, `interval_column`, `interval_unit` (`days` | `hours`),
+`parent`, `last_done`. The label/parent-label columns are rendered into an email,
+so they must be readable — remember they are decrypted through the codec.
+Reference apps: `pet-care`, `home-maintenance`, `plant-care`.
+
+## Hub-appended side effects (`write_effects`)
+
+Same-transaction SQL the hub appends when app SQL writes a declared table, keyed
+by **unprefixed trigger table**. The appended statements run with **hub
+authority**: row policies and column ACLs do not apply to them (the codec, the
+scope guard, and the row quota still do).
+
+It closes one class only — *"member A's write must atomically update state A
+cannot write directly"*: a counter on a row the caller does not own, a
+server-side rating fold. Verbs are `insert` and `delete`.
+
+```jsonc
+"write_effects": {
+  "lb_matches": {
+    "insert": [
+      { "label": "fold_participant_ratings", "statement": "INSERT INTO app_leaderboard__lb_participant_ratings (...) SELECT ... WHERE p.match_id = :new.id" }
+    ]
+  }
+}
+```
+
+Hard constraints — read these before declaring effects on an **existing** table:
+
+- Declaring insert effects **retroactively constrains the table's client SQL** from that release on. Every INSERT into it must be single-row `VALUES` with named columns and no `ON CONFLICT` tail. `INSERT…SELECT`, multi-row `VALUES`, and upserts are refused at runtime. Audit the app's existing write paths first.
+- An effect **target** table may not be `endpoint_only` — use `writable_by: []` instead.
+- Any column an effect computes must be listed in `db_plaintext_columns`. The effect writes raw SQL; it does not go through the codec on the way in.
+- In a batch, the row that triggers the effect goes **last**.
+- Two DELETEs against one effect-bearing table in a single batch are refused.
+
+Reference apps: `leaderboard`, `forum`, `vendors`.
+
+## Capabilities and entitlements
+
+Two orthogonal purchase gates, both **metadata only** — the hub enforces at its
+own endpoints regardless of what a manifest claims:
+
+```jsonc
+"required_capabilities": ["cron", "email"],
+"requires_entitlement":  "app.yes-no-maybe"
+```
+
+- `required_capabilities` — paid hub capabilities this app's features consume: `cron`, `email`, `sharing`, `ai_capture`, `geofence`. Unlocked **household-wide** by a capability bundle. Declare them so checkout and the app card tell the truth; a household without the bundle gets 402s and skipped crons, not a crash.
+- `requires_entitlement` — a **per-app** purchase key the household must own to install or run the app.
+
+The scheduled-notification protocols below all consume `cron` (and usually
+`email`). Declare the capabilities alongside them.
+
+## Scheduled notification protocols
+
+Three hub-cron protocols, each fully declarative. All accept
+`on_no_recipients: "adults" | "skip"` — what to do when a row names no valid
+recipient.
+
+### `inactivity_alerts` — dead-man's switch
+
+The hub exposes a check-in endpoint and a cron evaluator: if a member has not
+checked in within `interval_hours`, the named recipients are emailed.
+
+```jsonc
+"inactivity_alerts": {
+  "table": "connections", "member_column": "member_id", "id_column": "id",
+  "active_column": "active", "interval_hours_column": "interval_hours",
+  "last_checkin_column": "last_contact_at", "last_alerted_column": "last_alerted_at",
+  "message_column": "message",
+  "recipients_column": "recipient_member_ids",
+  "external_recipients_column": "recipient_emails",
+  "check_in_acl": { "require_role": "adult" }
+}
+```
+
+Required: `table`, `member_column`, `active_column`, `interval_hours_column`,
+`last_checkin_column`, `last_alerted_column`, `message_column`,
+`recipients_column`. Consumes `cron` + `email`.
+`external_recipients_column` pairs with `external_contacts` (below).
+Reference apps: `stay-in-touch`, `dead-mans-switch`, `wellness-check-in`,
+`accountability-partner`.
+
+### `date_reminders` — "X is in N days"
+
+Cron emails household members ahead of a recurring-annual or one-shot date.
+
+```jsonc
+"date_reminders": {
+  "table": "subscriptions",
+  "date_column": "next_renewal_date",
+  "lead_days_column": "lead_days", "default_lead_days": 5,
+  "enabled_column": "remind",
+  "title_column": "name", "kind_column": "category",
+  "owner_column": "payer_id",
+  "visibility_column": "remind_scope", "everyone_values": ["household"],
+  "last_reminded_column": "last_reminded_at",
+  "on_no_recipients": "adults"
+}
+```
+
+Required: `table`, `title_column`, `owner_column`, `last_reminded_column`. Use
+`month_column`/`day_column` for a recurring annual date (a birthday) or
+`date_column` for a concrete one; `one_shot_kind_values` + `one_shot_year_column`
+mark kinds that fire once. `visibility_column` + `everyone_values` decide whether
+a reminder reaches the household or only its owner. Consumes `cron` + `email`.
+Reference apps: `occasions`, `subscriptions`, `vehicle-maintenance`.
+
+### `schedule_reminders` — time-of-day nudges with escalation
+
+"8:00 AM — did you take it?", a completion signal, and an escalation if it is
+still missing after a grace period.
+
+```jsonc
+"schedule_reminders": {
+  "table": "medications", "id_column": "id",
+  "title_column": "name", "subtitle_column": "dosage",
+  "owner_column": "member_id", "enabled_column": "reminders_on",
+  "times_column": "reminder_times",
+  "days_of_week_column": "days_mask", "interval_days_column": "every_n_days",
+  "start_date_column": "started_on", "end_date_column": "ends_on",
+  "completion": { "table": "doses", "parent_fk_column": "medication_id",
+                  "date_column": "dose_date", "slot_column": "slot", "member_column": "logged_by" },
+  "nudge":      { "at_minutes": 0,  "audience": "owner",  "member_column": "remind_member_ids" },
+  "escalation": { "grace_minutes": 30, "audience": "adults", "member_column": "buddy_member_ids",
+                  "event": "medication.dose_missed" }
+}
+```
+
+Required: `table`, `title_column`, `owner_column`, `times_column`, `completion`.
+`audience` is `owner` | `adults` | `everyone`. Consumes `cron`; basic nudges are
+free within a household-wide monitored-item cap, **escalation is
+entitlement-gated**. One DO alarm is armed per household. Reference app:
+`medication-tracker`.
+
+### `external_contacts` — emailing outside the household
+
+A household-wide registry of **double-opt-in confirmed** external email
+addresses that capability-enabled apps may email. Declaring it opts the app into
+the registry; the confirmation flow is the hub's.
+
+```jsonc
+"external_contacts": { "invite_expiry_hours": 72 }
+```
+
+Pairs with `inactivity_alerts.external_recipients_column`. An unconfirmed address
+is never emailed. Reference apps: `stay-in-touch`, `dead-mans-switch`,
+`wellness-check-in`.
+
+## AI capture (`capture_consumer`)
+
+Declares that this app accepts AI-parsed capture suggestions as a write target,
+so capture routing is registry-driven rather than hardcoded per kind.
+
+```jsonc
+"capture_consumer": { "kinds": ["task"], "via": "structured" }
+```
+
+`kinds` — one or more of `event`, `task`, `grocery_item`.
+`via` — `"structured"` (the hub composes a validated write from parsed fields) or
+`"quick_add"` (a single text line). Consumes the `ai_capture` capability.
+Reference apps: `tasks` (task), `calendar` (event), `grocery` (grocery_item).
+
+## Companion app callout (`companion_app`)
+
+Display metadata for a "companion app" callout on the app's detail card. Purely
+presentational — it links to a native mobile app that pairs with this one.
+
+```jsonc
+"companion_app": {
+  "name": "Chickadee Garden",
+  "tagline": "Add and manage plants from your phone",
+  "ios_url": "https://apps.apple.com/…",
+  "android_url": "https://play.google.com/…"
+}
+```
+
+Only `name` is required. Reference apps: `garden-viewer`, `quiet-time`,
+`safe-zones`.
+
+## Remaining manifest keys — stub reference
+
+These exist, are in production use, and are fully specified in
+`manifest-schema.json`. They are narrow enough that the reference app is the
+fastest way to learn them — open its `manifest.json` and read the schema entry
+alongside.
+
+| Key | What it does | Read |
+|---|---|---|
+| `versioned_records` | Endpoint-owned records where a replacement **keeps** the version it replaced (row and file bytes) and a delete is a soft retire. Closes the direct UPDATE/DELETE lane rather than decorating it | `family-records` |
+| `partner_link` | Names the table that resolves a member to their current reciprocal partner. **Required** by the `couple_scoped` row policy and by `file_acls.read: "couple_scoped"` | `co-parenting`, `accountability-partner` |
+| `mutual_reveal` | Both members answer privately; answers unlock only once both have submitted | `yes-no-maybe`, `relationship-checkin` |
+| `mutual_signals` | Time-boxed reciprocal signals — a match notifies both, a one-sided signal reveals nothing | `desire-sync` |
+| `paired_messages` | Endpoint-mediated direct messages between linked partners, with read receipts | `co-parenting`, `love-notes` |
+| `couple_item_state` | Per-member state (rating, note) on a shared item, revealed reciprocally | `intimacy-jar` |
+| `secret_draw` | Server-side assignment draw with exclusions, so no participant can read the mapping | `secret-santa` |
+| `cycle_projection` | Materializes a recurring custody/duty rotation into concrete dated rows over a horizon, with exceptions | `co-parenting` |
+| `managed_finance` | Hub-managed billing periods and payments against a target app's ledger | `dues-contributions` |
+| `financial_ledger_imports` | Governed import of external ledger transactions | `reserve-fund` |
+| `geofence_zones` | Zone definitions and arrival/departure events | `safe-zones` |
+| `anonymous_ballot` | Ranked or majority voting where the receipt and the ballot are unlinkable | `officer-elections` |
+| `min_age` | Minimum member age the hub enforces before showing or installing the app | — |
+| `kiosk` | `"allow"` (default) or `"never"` — `"never"` makes the app un-allowlistable on shared kiosk devices by construction | — |
+| `contexts` | Tenant kinds the app can install into: `household` (default), `shared_space`, `shared_space.roster`. A `shared_space.<sub>` entry implies the base. Roster is **intent only** — the hub still gates the install on its own star-topology audit | — |
+| `db_encryption` | App-owned D1 encryption mode; defaults to `"default"`. Setting it to `"off"` disables the codec for the **whole app**, not one column | — |
+| `cdn_whitelist` | Trusted external origins added to the app's CSP. Everything not listed is blocked | — |
+| `exports` | KV store keys this app makes readable/writable by other apps, consumed as `app.{this-app-id}.{key}`. Gate writes with `export_acls` | — |

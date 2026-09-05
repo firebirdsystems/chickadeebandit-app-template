@@ -1,4 +1,5 @@
 {
+  "$schema": "https://chickadeebandit.com/manifest-schema.json",
   "id": "app-template",
   "name": "App Template",
   "version": "1.0.0",
