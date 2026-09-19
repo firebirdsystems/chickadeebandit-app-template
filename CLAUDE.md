@@ -2715,6 +2715,66 @@ Surfaces that need a *day count* ("12 days until Disney") send the **target
 date** to the client and let the device subtract. That way the number reflows at
 the viewer's own midnight without the hub's cached payloads having to be busted.
 
+### The range family (`agenda` only)
+
+The hub also has a **week** view, and an `agenda` entry can answer for a whole
+window in one statement instead of being asked once per day:
+
+| Token | Binds |
+|---|---|
+| `:range_start` / `:range_end` | first/last household-local `yyyy-mm-dd`, inclusive |
+| `:range_start_at` / `:range_end_at` | the instants opening the first day and closing the last (exclusive) |
+
+**Do not mix the families in one query** — publish refuses it. `:today` inside
+a range query has no single meaning (which day of the seven?), so the hub asks
+you rather than guessing. And range tokens are **agenda-only**: a `glance` or
+`kiosk_checklist` using one is refused, because those surfaces resolve no range
+and the tile would simply render empty.
+
+The two forms are both correct; they cost differently:
+
+- A **day-token** entry is *replayed* by the hub, once per day, each bound to
+  that day. This is what keeps an evaluation-shaped query right across a week
+  with no rewrite — `strftime('%w', :today)` is simply evaluated seven times.
+  It costs seven statements, and a heavy household can push its least-used apps
+  off the week.
+- A **range-token** entry runs once, whatever the window. On the day view the
+  hub binds `range_start = range_end = today`, so one query serves both
+  surfaces and you never declare which surface you are writing for.
+
+So rewrite a plain date lookup when you get the chance — it is one WHERE clause,
+and it is the difference between 7 statements and 1:
+
+```sql
+-- before
+WHERE plan_date = :today
+-- after
+WHERE plan_date BETWEEN :range_start AND :range_end
+-- instant-bounded
+WHERE x.completed_at >= :range_start_at AND x.completed_at < :range_end_at
+```
+
+A range-capable entry may also raise its `LIMIT` to 140 (the hub still caps 20
+rows per day). Leaving it at 20 means 20 rows for the *whole week*.
+
+Three rules the hub cannot check for you:
+
+- **Declare `on_range: "today_only"` when due-ness depends on what has been
+  logged so far** rather than on the bound day — "who am I overdue to call",
+  "who hasn't checked in". Replayed, such a query reports the same row on every
+  later day, because nothing can have been logged in the future. With the key
+  the hub runs it once and shows it only in today's column. A *schedule*
+  (`days_mask`, `event_month`, a date range) is the opposite case and wants the
+  default, `each_day`.
+- **Never write a backlog-shaped lookup** — `due_date <= :today` with no lower
+  bound. The `LIMIT` fills with the oldest rows and the hub's per-day filter
+  then drops them all, so the later days render empty. Bound it below.
+- **Reach back a day if you want carry-over.** The hub carries yesterday's
+  undone rows onto today flagged `overdue`, but only rows your query returned —
+  and `BETWEEN :range_start AND :range_end` cannot return yesterday's. Write
+  `BETWEEN date(:range_start, '-1 day') AND :range_end`; the hub drops the extra
+  day whenever it is not yesterday.
+
 ## Coherence checklist (every app, at creation)
 
 The hub reads as one product only when each app plugs into the shared,
@@ -2835,6 +2895,11 @@ agenda fails to install rather than silently showing nothing):
 - **Day tokens:** `:today` (household-local `yyyy-mm-dd`), `:day_start` /
   `:day_end` (ISO instants bounding the local day). The hub binds them as
   parameters — never string-interpolated.
+- **Range tokens:** `:range_start` / `:range_end` and `:range_start_at` /
+  `:range_end_at` answer the hub's **week** view in one statement instead of
+  seven. Never mixed with day tokens in the same query, and never used in a
+  `glance`. A range-capable entry may `LIMIT` up to 140. See "Household-local
+  dates" above for when to prefer which, and for `on_range: "today_only"`.
 - **`:me` — the requesting member's id.** Available in `agenda` and `glance`,
   bound the same way. **Reach for it only when the row policy genuinely can't
   answer "is this row mine".** An `owner_only` or `sealed_until` table already
