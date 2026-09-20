@@ -1,5 +1,7 @@
 # App Template
 
+A starter template for building apps that install into [Chickadee Bandit](https://chickadeebandit.com).
+
 Minimal starting point for a Chickadee Bandit app. Copy this folder, rename the `id` in `manifest.json` (and the `app_{appId}__` table prefix to match), then build from here. Ships one governed `items` table, a demo-mode fallback, and the standard build/dev tooling.
 
 Four documents, in the order you need them:
