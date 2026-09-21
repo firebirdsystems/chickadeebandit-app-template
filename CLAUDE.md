@@ -1011,7 +1011,79 @@ function canSeeItem(item) { return _canSeeItem(item, ME); }
 - Non-trivial filtering or sorting
 - Date/money formatting with edge cases
 
-**When not to:** DB calls, render functions, event handlers, and anything that closes over module-level state belong in the HTML script and don't need extraction.
+**When not to:** DB calls, render functions and event handlers normally belong
+in the HTML script. A list, a form and a delete confirm are not worth the
+indirection — render whole, re-render whole, done.
+
+The exception is below, and it is not a style preference: it is where this
+repo's defects actually come from.
+
+## Extracting a feature that has sequencing in it
+
+The rule above holds until a feature can have **two things in flight at once**.
+Then the inline-only structure stops being simpler and starts being the reason
+bugs survive review.
+
+Ask one question: **does any state here have to survive an `await`?** Concretely,
+does the feature have any of these?
+
+- two requests that can overlap, where the slower one must not win
+- an element that can be replaced or closed while a request is out
+- optimistic state that a failure has to roll back
+- a teardown (`closeModal`, a re-render) shared with other features
+
+If yes, extract the feature into `src/<feature>.js` as a controller with its
+dependencies passed in, and test it against a real DOM.
+
+**Why this is a rule and not a suggestion.** The wish-list share feature was
+built inline, the way the section above prescribes. It took four review rounds
+to stabilise, and two of those rounds found bugs introduced by the previous
+round's fixes. The worst one left the feature **non-functional end to end** —
+`openModal` tears down the previous modal at the *start* of an open, and the
+share target was held in module state beside it, so the teardown wiped the
+target while the modal was being built. Forty tests passed. Every one of them
+was a pure-function or source-text test, and none of them opened the modal.
+After extraction, reintroducing that same bug failed 14 of 20 DOM tests
+immediately.
+
+**Pattern:**
+
+1. `src/<feature>.js` — exports `create<Feature>(deps)`. It owns its own state
+   and reaches everything else through `deps`: the SDK helpers, `dbRun`, the
+   DOM primitives, and getters for app state (`getMembers: () => members`) so it
+   always reads the live value rather than a snapshot taken at wiring time.
+
+2. DOM primitives the feature shares with the rest of the page (the modal, a
+   toast) move into their own module too — `src/modal.js`. This matters: if the
+   test re-implements `openModal`, it tests a copy that does not have the bug.
+   The tests must drive the same code the page does.
+
+3. `src/index.html` wires them together and keeps the rendering of the page
+   itself. The feature module owns no DOM of its own.
+
+4. `__tests__/<feature>-ui.test.mjs` — starts with `// @vitest-environment jsdom`
+   (the config default stays `node`, so only this file pays for it). Add the
+   dependency once: `npm install --save-dev jsdom`.
+
+**Keep modal-scoped state on the modal, not beside it.** `open()` tears down
+whatever was there first, so anything held in a module variable alongside it is
+state that teardown can clear. Put it on the element — `el.dataset.shareTarget`
+— and read it back through a small pure helper. Then it is created and
+discarded with the thing it describes, and a late re-render after the modal
+closed, or after a *different* modal replaced it, simply finds nothing to do.
+Give each modal a `dataset.modal` kind so a repaint can tell.
+
+**What to test in the DOM lane.** Ordering and failure, not markup. Markup
+assertions rot on every copy edit and catch nothing. Worth a test:
+
+- the feature still works after the shared teardown has run
+- a slow response that lands after a newer one does not overwrite it
+- a re-render lands in the right element, or nowhere
+- a write that never reached the hub does not read as success
+- an error banner clears once a retry succeeds
+
+Assert on what the member would see (`textContent`, an input's `.value`), and
+prove a guard is not vacuous by reintroducing the bug and watching it fail.
 
 ## Adding search to an app
 
