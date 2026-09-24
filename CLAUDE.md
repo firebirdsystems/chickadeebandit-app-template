@@ -1392,6 +1392,7 @@ Read-all, **write-none via `/api/db`**. The only writer is `POST /run/{app}/api/
 - Adults: unrestricted by default. Set `"adults_bypass": false` to restrict adults too (e.g. each adult only sees their own rows).
 - Add `"privileged_groups": [{ "settings_table": "settings", "settings_key": "board_group_id" }]` to give members of a configurable hub group (e.g. "board", "admins") unrestricted access regardless of `adults_bypass`. Add `"actions": ["insert"]` (any subset of `select`/`insert`/`update`/`delete`) to an entry to scope its privilege to those statement kinds, and list multiple entries for per-role power (treasurer inserts, secretary edits). See [`privileged_groups`](#privileged_groups) below.
 - Add `"insert_privileged_only": true` (requires a `privileged_groups` entry covering `"insert"`) to block `INSERT` for everyone except the privileged group — returns 403 for all other callers regardless of adult status. SELECT/UPDATE/DELETE are unaffected. `"delete_privileged_only": true` (requires `"delete"` coverage) does the same for DELETE.
+- `"member_can_update": false` blocks non-adults from UPDATE/DELETE only — they can still INSERT their own rows (redemption requests). Add `"member_can_insert": false` to block their INSERT too, for tables only adults manage (medication-tracker `medications`). Only non-adults are blocked: every adult (including a non-steward adult in a shared space, whose row is stamped to them) and privileged members still insert, and a household adult or steward can insert for a child.
 - Add `"endpoint_writes_only": true` to block all app-originated INSERT/UPDATE/DELETE while keeping owner-based read filtering in place. Use this when a table's data must only be written by a trusted hub endpoint (e.g. vote receipts created by `anonymous_responses`), but reads should still be filtered by ownership and `adults_bypass`:
 
 ```json
@@ -1674,6 +1675,15 @@ a transaction against another member's bank by guessing its id.
   `write_owner_only: true`, in which case adults (like everyone else) are
   restricted to `member_column = <caller>`.
 - `INSERT`: always forces `member_column` to the caller — you own what you create.
+- Add `"supervisor_assigns_owner": true` when an adult records rows **for** a
+  member (a parent ticking a chore for a login-less kid, creating a child's
+  savings goal): a supervisor's INSERT then keeps the `member_column` value the
+  app supplied. Supervisor means a household adult or a roster steward — never a
+  coparenting/general-space steward, who is still stamped. Everyone else is
+  still stamped, and a blank owner falls back to the caller. Cannot be combined
+  with `write_owner_only`. A supervisor's `ON CONFLICT … DO UPDATE` on such a
+  table is refused (the conflict key no longer proves the row is theirs).
+  References: chores `completions`, nest-egg `savings_goals`.
 - Add `"insert_privileged_only": true` (requires a `privileged_groups` entry covering `"insert"`) to block `INSERT` for everyone except the privileged group — returns 403 for all other callers regardless of adult status. The column is still forced to the caller for privileged inserts. SELECT/UPDATE/DELETE are unaffected by this flag.
 - Add `"write_visibility_scoped": true` for **writes that follow reads**: a
   caller may `UPDATE`/`DELETE` exactly the rows they can `SEE` (their own, plus
