@@ -156,5 +156,5 @@ for before you ship:
 - **`NULLS LAST` is unsupported.** Use `ORDER BY (col IS NULL), col`.
 - **`date('now')` is UTC, not the household's day.** Any date you store or compare must come from the household-local helper (`hubToday()`), never from the device clock. A floating `YYYY-MM-DDTHH:MM` stored in an app table is **household-local**, never UTC.
 - **`db_encryption: "off"` gates the whole app**, not one column. Check it before concluding a column is encrypted.
-- **A declared integration that nothing calls.** `publishes` / `alert_on` / `subscribes_to` in the manifest do not wire anything up — the app must actually call the endpoint.
+- **A declared integration that nothing calls.** `publishes` / `alert_on` in the manifest do not wire anything up — the app must actually call the endpoint.
 - **A field named `event` in an operational log payload** overwrites the event *name*. Pick another key.

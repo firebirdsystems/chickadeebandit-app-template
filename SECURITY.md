@@ -99,7 +99,7 @@ is in [CLAUDE.md](CLAUDE.md) → "Row-level access control".
   - `anonymous_responses` / `anonymous_ballot` → response/ballot table `endpoint_only`, receipt table `owner_only` + `endpoint_writes_only: true`.
 - [ ] **`anonymous_responses` counting.** Every "has responded" or response-count query — list view, widget, AI export — must join the **receipt** table, not the responses table. `member_id` is NULL in `responses` for anonymous submissions, so `COUNT(DISTINCT member_id)` always returns 0. Check `widget.html` and `src/queries/*.sql` separately from `index.html`.
 - [ ] **`canManage`-style helpers.** Does the helper grant manage access to the row creator regardless of role? If the table is `adult_writable`, a non-adult creator will see manage controls and get a silent 403 on every action — misleading UX, and a sign the client gate does not mirror the server. `canManage` should require `isAdult`, not `created_by === me.id`.
-- [ ] **Declared integrations actually wired.** If the manifest declares `publishes` and `alert_on`, does the code actually call the events endpoint after the relevant action? A missing `publishEvent("survey.closed", …)` after a status UPDATE means the declared integration is dead even though `publish_acls` is perfect. Same for `subscribes_to`.
+- [ ] **Declared integrations actually wired.** If the manifest declares `publishes` and `alert_on`, does the code actually call the events endpoint after the relevant action? A missing `publishEvent("survey.closed", …)` after a status UPDATE means the declared integration is dead even though `publish_acls` is perfect.
 
 ---
 

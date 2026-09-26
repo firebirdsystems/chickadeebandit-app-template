@@ -620,7 +620,8 @@ The hub enforces `require_role` server-side when the events endpoint is called �
         "table": "chores",
         "match": { "id": "chore_id" },
         "stamp": { "points": "points" }
-      }]
+      }],
+      "fresh": { "column": "week", "past_days": 14, "future_days": 0 }
     }]
   }
 }
@@ -629,6 +630,7 @@ The hub enforces `require_role` server-side when the events endpoint is called �
 - `key` — exactly the columns of the table's PRIMARY KEY or a UNIQUE constraint, each declared `TEXT` (no `COLLATE NOCASE`) and bound as a string, and plaintext by name (built-in, a `*_id`/`*_at`/`*_date`/`*_by`/`*_time` suffix, or in `db_plaintext_columns`) unless the app sets `db_encryption: "off"`. The event id is derived from them, so checking, unchecking and checking again is ONE event and one credit. Every key column must be bound in the INSERT, never NULL.
 - `payload` — payload key → column of the inserted row. `subject` (optional) is the column stored as the event's `subject_id`. The event's publisher is the member who wrote the row.
 - `lookups` (up to two) — read one row of another of your tables, matched only on inserted columns or `{ "const": … }` values, and copy its columns into the payload (`stamp`: payload key → column). A lookup table must be one no member can write and every member can read: `adult_writable` (no `member_read_column`, not `endpoint_writes_only`, no `column_read_acls` on the copied columns) or `app_config`, and not a `write_effects` target, share-link submit table or retention fold target. Its match must cover a PRIMARY KEY or UNIQUE constraint on plaintext columns. A lookup that finds no row emits nothing; the insert still lands.
+- `fresh` (optional) — emit only for a row dated near today, so back-filling last month earns no points and logging a missed dose doesn't notify anyone now. `column` must be one of the `key` columns and hold a `YYYY-MM-DD` date or an ISO week `YYYY-Www` (a week counts as Monday to Sunday and is in the window when any of its days is). "Today" is the household's local date, the same day `:today` binds to. A row dated more than `past_days` before today or more than `future_days` after it (each 0–366, both required) still lands but emits nothing, and so does a value in neither format. Such a row's key is not spent: deleting it and inserting it again inside the window emits.
 - The trigger table must be `owner_or_visibility` (a child writes only their own rows; `supervisor_assigns_owner` lets an adult record for them) or `adult_writable`. `member_writable` is refused: any member could name anyone in the event. On `owner_or_visibility`, a row emits only when its stored visibility is one of `everyone_values`, so a private row never announces itself. A row inserted and deleted in the same batch emits nothing.
 - The event type must be catalogued, listed in `publishes` (that is what makes automations on it eligible), and not also a share-link `submit.event`; it may not declare `publish_acls.<type>.require_group_setting` (the emit would bypass it). One table emits one type.
 - Once a table emits a type, the hub refuses a browser POST of that type from your app (403). Remove the client publish.
@@ -3640,24 +3642,30 @@ it whenever an event asserts that a privileged action happened. Gating the table
 and the push notification while leaving the event bus open to any adult is a
 real, shipped bug class.
 
-## The event bus (`publishes`, `alert_on`, `subscribes_to`)
+## The event bus (`publishes`, `alert_on`)
 
-Three parallel arrays of event-type strings:
+Two parallel arrays of event-type strings:
 
 ```jsonc
-"publishes":     ["leaderboard.match_recorded"],
-"alert_on":      ["leaderboard.match_recorded"],
-"subscribes_to": ["game.completed"]
+"publishes": ["leaderboard.match_recorded"],
+"alert_on":  ["leaderboard.match_recorded"]
 ```
 
 - `publishes` — event types this app emits. Declaring it does nothing on its own; the app must actually `POST /run/{app}/api/events`.
 - `alert_on` — a **subset of `publishes`** that lights the household notification bell.
-- `subscribes_to` — event types this app consumes. Same rule: declaring it does not wire anything, it authorizes the app to receive them.
+
+An app reads back only the event types it publishes (`GET /run/{app}/api/events`
+refuses any other type with a 403). There is no manifest key for reading another
+app's events. To act on one, declare an `automation_actions` recipe and a
+`suggested_automations` entry that triggers it (see "Automation actions"); the hub runs
+it when the event is published, whether or not anyone has your app open.
+Leaderboard imports Sea Battle and Quiet Time games this way.
 
 Use event types from the shared catalog (`event-catalog.json`, served at the
-hub's `/event-catalog.json`) so publishers and subscribers agree. An
-uncatalogued type is permitted but nothing else will listen for it. Gate emission
-with `publish_acls` when the event asserts something privileged.
+hub's `/event-catalog.json`) so publishers and consumers agree. An
+uncatalogued type is permitted, but the automations rule builder offers no
+payload fields for it. Gate emission with `publish_acls` when the event asserts
+something privileged.
 
 ## Weekly digest contribution (`digest`)
 
@@ -3713,8 +3721,11 @@ Hard constraints — read these before declaring effects on an **existing** tabl
 - Declaring insert effects **retroactively constrains the table's client SQL** from that release on. Every INSERT into it must be single-row `VALUES` with named columns and no `ON CONFLICT` tail. `INSERT…SELECT`, multi-row `VALUES`, and upserts are refused at runtime. Audit the app's existing write paths first.
 - An effect **target** table may not be `endpoint_only` — use `writable_by: []` instead.
 - Any column an effect computes must be listed in `db_plaintext_columns`. The effect writes raw SQL; it does not go through the codec on the way in.
+- **An `INSERT … SELECT` effect needs `db_encryption: "off"`.** Under at-rest encryption an effect INSERT must be single-row `VALUES`: a row built by SELECT (a fold over another table, a `json_each` expansion) has no bound value for the codec to encrypt, and no `db_plaintext_columns` entry changes that. Encryption is app-wide, so decide this before choosing the shape.
+- **An insert effect may bind `:new.<col>` only for columns every client INSERT names.** The hub resolves `:new` from the triggering INSERT's column list and refuses an INSERT that leaves a bound column out. To read any other column of the new row, select it back by `WHERE id = :new.id`.
+- An effect may not INSERT into a table whose `frozen_when` names a parent, except children of the parent row whose own insert fired it: declared on the parent table's `insert`, child fk bound to exactly `:new.id`, parent `id` unique.
+- Budgets: at most 3 effects per table and verb, 8 per app, 2,000 characters per statement.
 - In a batch, the row that triggers the effect goes **last**.
-- Two DELETEs against one effect-bearing table in a single batch are refused.
 
 Reference apps: `leaderboard`, `forum`, `vendors`.
 

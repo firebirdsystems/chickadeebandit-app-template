@@ -161,7 +161,7 @@ the end of CLAUDE.md.
 
 | Key | Purpose |
 |---|---|
-| `publishes` / `alert_on` / `subscribes_to` | The event bus. `alert_on` is a subset of `publishes`. See "The event bus" |
+| `publishes` / `alert_on` | The event bus. `alert_on` is a subset of `publishes`. See "The event bus" |
 | `automation_actions` | Actions household automations may invoke, executed as trusted scoped SQL |
 | `suggested_automations` | Starter-rule hints in the automations settings UI |
 | `write_effects` | Hub-appended same-transaction side-effect SQL. Constrains the trigger table's client SQL — read the constraints first |
