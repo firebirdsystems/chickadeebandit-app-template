@@ -579,11 +579,14 @@ await fetch(EVENTS_URL, {
     type: "event.type",       // e.g. "allowance.weekly"
     subject_id: memberId,
     payload: { /* ... */ },
+    idempotency_key: `${choreId}:${memberId}:${week}:${day}`, // optional, see below
   }),
 }).catch(() => {});
 ```
 
 If your manifest declares `publishes` and/or `alert_on`, you **must** call the events endpoint in app code after the relevant action — declaring these fields alone does nothing. Always call it as a fire-and-forget side effect after the UI has already updated.
+
+**`idempotency_key`: send it whenever the same fact can be published twice.** A checkbox that is ticked, unticked and ticked again publishes again, and every publish runs the household's automations and bell alerts. Chores re-credited Rewards points on each re-tick this way. With a key, every publish of the same type and key is one stored event; repeats are accepted but run nothing. Build the key from what identifies the fact (chore, member, week, day), never from a timestamp or a random id. The hub hashes it with the household, app, event type and the member the event is about, so it only has to be unique within your app and event type. That member is the `subject_id` when an adult publishes, and the publisher themselves otherwise, so send the member as `subject_id` for a parent's tick and a child's own tick to count as one. The SDK takes it as `events.publish(type, payload, subjectId, { idempotencyKey })`.
 
 ### `publish_acls` — gating who may emit an event
 
@@ -600,6 +603,40 @@ Any household member can POST to your app's events endpoint. If an event carries
 ```
 
 The hub enforces `require_role` server-side when the events endpoint is called — a child POSTing the event directly gets a 403. Declare `publish_acls` for any event whose payload another app treats as authoritative.
+
+### Row-derived events — making a member-published number trustworthy
+
+`require_role` decides WHO may publish; it says nothing about WHAT they put in the payload. A child who may publish `chore.completed` could POST it with `points: 100000`, and an automation crediting `points` would pay it. When an event reports a row your app writes, let the hub publish it instead: declare `write_effects.<table>.emit`, and every INSERT into that table publishes the event, built from the inserted row and from rows it looks up, in the same transaction as the insert. This is Chores' declaration:
+
+```json
+"write_effects": {
+  "completions": {
+    "emit": [{
+      "event": "chore.completed",
+      "key": ["chore_id", "member_id", "week", "day"],
+      "payload": { "chore_id": "chore_id", "member_id": "member_id", "week": "week", "day": "day" },
+      "subject": "chore_id",
+      "lookups": [{
+        "table": "chores",
+        "match": { "id": "chore_id" },
+        "stamp": { "points": "points" }
+      }]
+    }]
+  }
+}
+```
+
+- `key` — exactly the columns of the table's PRIMARY KEY or a UNIQUE constraint, each declared `TEXT` (no `COLLATE NOCASE`) and bound as a string, and plaintext by name (built-in, a `*_id`/`*_at`/`*_date`/`*_by`/`*_time` suffix, or in `db_plaintext_columns`) unless the app sets `db_encryption: "off"`. The event id is derived from them, so checking, unchecking and checking again is ONE event and one credit. Every key column must be bound in the INSERT, never NULL.
+- `payload` — payload key → column of the inserted row. `subject` (optional) is the column stored as the event's `subject_id`. The event's publisher is the member who wrote the row.
+- `lookups` (up to two) — read one row of another of your tables, matched only on inserted columns or `{ "const": … }` values, and copy its columns into the payload (`stamp`: payload key → column). A lookup table must be one no member can write and every member can read: `adult_writable` (no `member_read_column`, not `endpoint_writes_only`, no `column_read_acls` on the copied columns) or `app_config`, and not a `write_effects` target, share-link submit table or retention fold target. Its match must cover a PRIMARY KEY or UNIQUE constraint on plaintext columns. A lookup that finds no row emits nothing; the insert still lands.
+- The trigger table must be `owner_or_visibility` (a child writes only their own rows; `supervisor_assigns_owner` lets an adult record for them) or `adult_writable`. `member_writable` is refused: any member could name anyone in the event. On `owner_or_visibility`, a row emits only when its stored visibility is one of `everyone_values`, so a private row never announces itself. A row inserted and deleted in the same batch emits nothing.
+- The event type must be catalogued, listed in `publishes` (that is what makes automations on it eligible), and not also a share-link `submit.event`; it may not declare `publish_acls.<type>.require_group_setting` (the emit would bypass it). One table emits one type.
+- Once a table emits a type, the hub refuses a browser POST of that type from your app (403). Remove the client publish.
+- A type the event catalog marks `"derivation": "row"` (see `event-catalog.json`; `chore.completed` is one) can ONLY be emitted from rows: listing it in `publishes` without an emit is refused at admission, and no app may POST it.
+- Declaring an emit constrains that table's client SQL, like any `write_effects`: a plain single-row `INSERT … VALUES` with named columns. `INSERT OR IGNORE`, `INSERT OR REPLACE`, `ON CONFLICT` and multi-row inserts are refused (400) because the hub cannot tell whether the row landed. Treat a UNIQUE constraint error as "already there".
+- An automation may not insert into a table that emits (admission refuses your own action that does), nor fill a column an emit copies from with a payload value. Updating an emitting table's rows is fine.
+- Each stored event counts against your app's daily row-event quota (500 per UTC day); past it the row still lands but no event is stored.
+- An app that emits is not available in roster spaces.
 
 ## File uploads
 
@@ -3573,7 +3610,7 @@ defaults to "any household member" if you omit it.
 |---|---|---|
 | `store_acls` | `/run/{app}/api/store` reads and writes, **per key** | `{ "<key>": { "read": rule, "write": rule } }` |
 | `notification_acls` | `/run/{app}/api/notifications/send` | `{ "send": { "require_group_setting": {...} } }` |
-| `publish_acls` | `/run/{app}/api/events`, **per event type** | `{ "<event>": { "require_role", "require_group_setting" } }` |
+| `publish_acls` | `/run/{app}/api/events`, **per event type** | `{ "<event>": { "require_role", "require_group_setting" } }` — for an event that reports a row your app writes, publish it from the row instead (`write_effects.<table>.emit`, see "Row-derived events"); e.g. Chores emits `chore.completed` from `completions` |
 | `export_acls` | cross-app writes (`/api/cross-write`), **per export key** | `{ "<key>": { "require_group_setting": {...} } }` |
 | `file_acls` | `/api/files` | see "File and document access control" |
 | `document_acls` | `/api/documents` | see "File and document access control" |
