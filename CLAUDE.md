@@ -2594,6 +2594,51 @@ Rules worth knowing before you use it:
 - **`where`, `parent_where.column` and `order_column` must be plaintext** (built-in name, `_id`/`_at`/`_date`/`_by` suffix, or listed in `db_plaintext_columns`). SQL cannot filter or sort ciphertext, and the failure would be silent. Projected `columns` are decrypted normally and need no such declaration.
 - **Entry files are capped** at 12 per entry and 100 across the feed; they stream through the same gated `/api/share/{token}/file/{id}` endpoint as the item-level `files` block.
 
+### `calendar` — the same link as a calendar subscription
+
+A share page has no "upcoming only" filter and nobody checks a web page for "what's on Saturday". An item type that declares `calendar` is ALSO served as an iCalendar feed at `/api/share/{token}/calendar.ics`, which Google, Apple and Outlook Calendar subscribe to and re-poll. It is the same link: expiry, revocation, the household sharing policy and the plan turn the page and the feed off together.
+
+```jsonc
+"calendar": {
+  "title_prefix_from_item": true,       // "U10 Soccer · Game"
+  "title_value_labels": { "game": "Game", "practice": "Practice" },
+  "item_location_column": "location",   // shared-row column used when an event has no location
+  "name_column": "name",                // calendar name; default title_column
+  "source": {
+    "kind": "rows",                     // one event per child row
+    "table": "sessions",
+    "fk_column": "activity_id",         // PLAINTEXT, and must lead an index, like a feed's
+    "date_column": "session_date",      // household-local yyyy-mm-dd, PLAINTEXT, never a *_at instant
+    "start_time_column": "start_time",  // HH:MM; empty or free text = all-day
+    "end_time_column": "end_time",
+    "title_column": "kind",
+    "location_column": "location",
+    "description_column": "notes",      // omit unless it is public
+    "where": [{ "column": "status", "values": ["scheduled"] }]
+  }
+}
+```
+
+When an event is a join (a timetable is lessons × periods × school days), use an `sql` source instead:
+
+```jsonc
+"source": {
+  "kind": "sql",
+  "query": "SELECT l.id || ':' || s.day_date AS uid, l.subject AS title, s.day_date AS start_date, p.start_time AS start_time, p.end_time AS end_time, l.room AS location FROM app_x__school_days s JOIN app_x__lessons l ON l.timetable_id = s.timetable_id AND l.slot = s.slot JOIN app_x__periods p ON p.id = l.period_id WHERE s.timetable_id = :item_id AND s.day_date BETWEEN :range_start AND :range_end ORDER BY s.day_date, p.start_time LIMIT 2000"
+}
+```
+
+Rules worth knowing:
+
+- **The window is 30 days back to 400 days ahead** of the household's today, at most 2,000 events. That window is the "upcoming only" filter; you do not write one.
+- **An `sql` source** selects only the aliases `uid`, `title`, `start_date` (all three required), `start_time`, `end_time`, `location` and `description`. Its outer WHERE must carry `<column> = :item_id` as a top-level AND term (not under OR, in a subquery or only in a JOIN's ON), and it must bound the dates below with `:range_start`, compared against plaintext columns. The first `ORDER BY` term must be that date, ascending (the LIMIT keeps the first rows, so they must be the soonest), and it ends in a `LIMIT` of at most 2,000. The hub runs the query twice, once for the upcoming window and once for the past month, so the LIMIT should cover a month of past events. Use 2,000 unless there is a reason not to. Dates are household-local `yyyy-mm-dd`: a `*_at` column (a UTC instant) is refused as the event date or the windowed column. No other tokens. Encrypted columns may be SELECTED (they are decrypted) but never compared or concatenated.
+- **Never over visitor-written rows.** A calendar may not read a table any item type's `submit` form writes, and an `sql` source may not read the clock (`date('now')`, `CURRENT_DATE`): the window is the household's day, SQLite's is UTC.
+- **`:item_id` is a guard, not a proof.** Row policies do not apply to share reads, so a query that is not really scoped to the item publishes every item's schedule behind every link. Pin the query in `shareable.test.mjs`.
+- **Times are household-local.** When the household has a time zone the feed converts each event to UTC, so a subscriber in another zone sees the right moment; without one the times are floating.
+- **A password-protected link serves no feed** (a calendar app cannot answer a prompt). The mint and list replies carry `calendarUrl` only when the link has a feed; `share.calendarUrl(link)` from `/hub-sdk.js` turns it into a `webcal://` subscribe link. Pass it to `src/share.js` as `calendarUrl`, and offer `SHARE_CALENDAR_EXPIRY_CHOICES` (up to a year) instead of `SHARE_EXPIRY_CHOICES` — a subscription stops updating when its link expires.
+- **Close the item when it leaves the app.** If archiving hides a row from your UI, gate the item with `visible_where` on the archive flag: otherwise the page and the feed outlive the panel that could revoke them.
+- **Revocation is not instant for a subscriber.** Calendar providers cache the feed for hours; the shared panel says so.
+
 ## Append-only records — `append_only_records`
 
 For immutable history rows, receipts, predictions, audit notes, and other "add a new record, never edit/delete it" data, use `append_only_records` instead of writing the table directly through `/api/db`.
