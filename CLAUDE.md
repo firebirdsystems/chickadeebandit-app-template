@@ -1223,7 +1223,29 @@ from `members` (defaults to the first); `{{alias}}` interpolates that member's
 id into `params`/`value`. `expect` supports `status`, `rowCount`, `rowsContain`
 (subset match), and `errorIncludes`. The schema is `ScenariosFileSchema` in the
 hub's `@chickadee/hub-contract`. Reference examples: `tasks/scenarios.json`
-(private-visibility) and `couples-bucket-list/scenarios.json` (couple scoping).
+(private-visibility, and a shared-space pair) and
+`couples-bucket-list/scenarios.json` (couple scoping).
+
+Roles are `adult`, `child`, `guest` and `admin` (an adult holding the tenant's
+admin flag). Every `db`/`publish`/`store`/`context` step first passes the same
+admission gate `/run/<app>` asks, so:
+
+- a `guest` reaches the app only when listed in `"granted": ["alias", …]` (a
+  per-member grant) — guests are default-deny;
+- a `child` on an app with `default_audience: "adults"` needs a grant too,
+  otherwise every step answers 403 "This app is not available to this member".
+
+Who is admitted at all is already proven for every app by the hub's generated
+admission suite; scenarios cover what an admitted member may then do.
+
+`"context": "shared_space"` runs the scenario in a shared space instead of a
+household. There, every adult is a full member but only the `admin` (the
+steward) supervises other members' rows: `owner_only` `adults_bypass`, the
+`owner_or_visibility` write-others branch, `adult_writable` read-all over a
+`member_read_column`, `inherit_visibility` `adults_bypass`, and
+`column_read_acls` `visible_to: ["adult"]` all follow the steward, not every
+adult. contract-ci rejects a space scenario when `contexts` doesn't admit
+`shared_space`.
 
 ## Demo mode
 
