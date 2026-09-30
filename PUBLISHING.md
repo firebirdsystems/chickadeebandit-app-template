@@ -6,7 +6,10 @@ There are **two gates** between your code and a running app:
 2. **Hub admission** — when the bundle is installed or updated, the hub re-validates the manifest against the real schema and the real database conventions. This gate is stricter, and it is where most surprises happen.
 
 `preflight.sh` (wired up by `make setup`) runs the first gate before every push.
-Nothing runs the second gate for you, so this page is the map.
+With a hub checkout beside the apps folder it also runs the hub's contract
+suite, which covers much of the second gate: the same manifest validator,
+migrations applied to SQLite, row policies and preload query plans. Admission
+itself only happens at install, so this page is the map.
 
 ---
 

@@ -44,7 +44,7 @@ __tests__/           vitest specs — manifest validation and your extracted log
 scenarios.json       Optional behavioral scenarios the hub can exercise
 build.mjs            Bundles src/ + migrations/ → dist/bundle.json, and validates the manifest
 dev.mjs              Local preview server with a stubbed hub runtime
-preflight.sh         Build + test gate; run by the pre-push hook
+preflight.sh         Build, tests, and the hub's checks; run by the pre-push hook
 dist/
   bundle.json        Output — this is what you install
 .github/workflows/
@@ -53,7 +53,7 @@ dist/
 
 ### Tooling notes
 
-- **`make setup` is not optional.** It points `core.hooksPath` at `.githooks`, which runs `preflight.sh` (build + tests) before every push. Without it a broken bundle can reach a release.
+- **`make setup` is not optional.** It points `core.hooksPath` at `.githooks`, which runs `preflight.sh` before every push: build, tests, and — when a hub checkout sits beside the apps folder — the hub's contract suite and runtime exercise for this app. Without it a broken bundle can reach a release.
 - **`make help`** lists every target.
 - **Migrations run outside the encryption codec.** A literal string written by a migration lands in the database as plaintext. Only column-to-column backfills are safe there. See CLAUDE.md → "Migration SQL".
 - **`hub-sdk.js` is vendored, not bundled.** The hub serves it at `/hub-sdk.js`; import from that path. `.hub-sdk.js` is gitignored — see CLAUDE.md → "Updating hub-sdk.js" for the refresh command.
