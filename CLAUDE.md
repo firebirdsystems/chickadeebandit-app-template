@@ -2706,6 +2706,8 @@ Pair each append-only target table with either `row_policies.{table}.kind = "end
 }
 ```
 
+`"parent_owner_column": "<column>"` (requires `parent_table`) lets only the member named in that column of the parent row append. Use it for any record that decides the parent's outcome — a bet's winners, a contest's result — or any other member could plant a row the owner later ratifies without seeing it. Close the endpoint once the outcome is final (`parent_blocked_status_values`), and write the deciding rows *before* flipping the parent to that status.
+
 ```js
 async function appendRecord(name, data) {
   const res = await fetch(`${window.__APPEND_RECORD_URL}/${encodeURIComponent(name)}`, {
