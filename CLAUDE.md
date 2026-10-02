@@ -125,6 +125,51 @@ async function loadMembers() {
 }
 ```
 
+## Detected drives (`family.drives`)
+
+Drives recorded by the Chickadee Locate companion app are hub-native data, read
+through the context like members:
+
+```js
+const ctx = await (await fetch(`${CONTEXT}?keys=family.drives&days=35`)).json();
+const trips = ctx["family.drives"];           // newest first; `days` is 1–365, default 14
+const full = (ctx.$partial ?? []).includes("family.drives"); // true = more than one page; totals undercount
+```
+
+Each trip has `id`, `memberId`, `startedAt`, `endedAt`, `minutes`,
+`nightMinutes`, `distanceM`, `avgSpeedKph`, `maxSpeedKph`, `speedBands` (seconds
+in each 10 km/h band, slowest first), `start` / `end` (`lat`, `lng`, optional
+`label`), `status` (`unconfirmed`, `driver`, `passenger`, `ignored`) and
+`events`: `hard_brake` / `hard_acceleration` (with `value`, m/s²) and
+`phone_call` / `phone_unlocked` (with `durationS`, and `speedKph` — how fast
+the car was going when it began — when the phone could tell; the hub draws no
+"stopped" line, the reader does). The route is separate and
+kept for 30 days: ask for `family.drives.trip:{id}` and read `polyline`
+(`[lat, lng, secondsFromStart]`); it is `null` when the route has aged out or
+the viewer may not read the trip.
+
+Ask for `family.drives.drivers` (covered by the same `family.drives`
+declaration) to learn who is being monitored before any trip arrives: each
+entry has `memberId`, `recording` (false when the driver's own map choice stops
+drives being recorded) and `phoneSeenAt` (when their phone last reported, or
+`null`). Every trip in `family.drives` is one the viewer may mark.
+
+- **The hub decides whose trips arrive.** A non-adult gets their own; a
+  supervising adult gets the non-adults'; an adult's own drives are returned to
+  that adult alone. Never widen it, and never cache trips where another member
+  could read them.
+- **There is no speed limit in the data.** Apply your own to `speedBands` when
+  you read a trip.
+- **"Phone unlocked" is all the phone knows** — not what it was used for. Say
+  "unlocked" in your copy.
+- **Marking a trip** needs `"family.drives"` in `data_access.writes`. Then
+  `POST /run/{APP_ID}/api/drives/trip-status` with `{ tripId, status, reason? }`
+  relabels it. A label only: nothing else about a trip can be changed. Who may
+  mark whose is the hub's rule (a member their own, a supervising adult a
+  non-adult's); a trip that is not the caller's to mark answers 404.
+
+Reference app: `safe-driving`.
+
 ## Notifications
 
 ```js
