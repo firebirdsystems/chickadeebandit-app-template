@@ -983,6 +983,26 @@ await crossWrite("grocery", "pending_items", [
 
 Writes count against the **calling** app's daily write quota, not the target app's.
 
+### When a stored value can't be read (`STORE_UNREADABLE`)
+
+A KV read or write can answer **HTTP 409** with `{ "error": "...", "code": "STORE_UNREADABLE" }`. It means the entry exists but the hub cannot decrypt it right now. It is a hub-side key problem, not a bug in your app, and it clears when the hub's operator fixes it.
+
+**Do not treat it as "nothing stored".** The failure mode this code exists to prevent is an app that fails to read its state, falls back to its defaults, and saves them over the real data:
+
+```js
+const res = await fetch(`${STORE}?key=state`);
+if (res.status === 409 && (await res.clone().json()).code === "STORE_UNREADABLE") {
+  showBanner("Your saved data can't be loaded right now. Try again later.");
+  return; // do NOT initialise defaults, and do NOT write
+}
+const { value } = await res.json();
+const state = value ? JSON.parse(value) : DEFAULT_STATE; // null really does mean "nothing stored yet"
+```
+
+- A **read** of one key, or a key listing that contains an unreadable entry, answers 409 with this code.
+- A **write** (POST or PATCH) over an unreadable entry is refused with the same 409. The stored entry is left exactly as it was.
+- There is no `Retry-After`: unlike a `503` with `code: "STORE_BUSY"`, retrying in a second will not help. Show the `error` sentence, which is written for users, and stop.
+
 ### The inbox pattern (for `storage: db` apps)
 
 DB-storage apps can't receive writes directly into their SQL schema. Instead, expose a KV key as an inbox, then drain it on load:
