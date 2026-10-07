@@ -73,6 +73,7 @@
     textarea { min-height: 60px; resize: vertical; }
     input:focus, textarea:focus { outline: none; border-color: var(--accent); }
     .empty, .loading { color: var(--muted); text-align: center; padding: 28px 16px; }
+    .empty p { margin: 12px 0 0; }
     .error { background: var(--red-soft); color: var(--red); padding: 9px 12px; border-radius: 8px; margin-bottom: 10px; font-size: .86rem; }
   </style>
   <base href="/run/app-template/">
@@ -83,7 +84,7 @@
 </div>
 
 <script type="module">
-import { esc, isAdult, searchMatch } from "/hub-sdk.js";
+import { esc, isAdult, searchMatch, chickadee } from "/hub-sdk.js";
 
 // --- Hub runtime globals (empty in demo mode) --------------------------------
 const CONTEXT = window.__CONTEXT_URL ?? "";
@@ -252,9 +253,9 @@ function render() {
 }
 
 function renderList() {
-  if (!items.length) return `<div class="card empty">No items yet.</div>`;
+  if (!items.length) return `<div class="card empty">${chickadee("nest")}<p>No items yet.</p></div>`;
   const list = searchQ ? items.filter(i => searchMatch(searchQ, searchableFields(i))) : items;
-  if (!list.length) return `<div class="card empty">No items match "${esc(searchQ)}".</div>`;
+  if (!list.length) return `<div class="card empty">${chickadee("searching")}<p>No items match "${esc(searchQ)}".</p></div>`;
   return list.map(renderItem).join("");
 }
 
