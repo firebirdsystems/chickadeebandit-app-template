@@ -1314,6 +1314,24 @@ steward) supervises other members' rows: `owner_only` `adults_bypass`, the
 adult. contract-ci rejects a space scenario when `contexts` doesn't admit
 `shared_space`.
 
+An app that lists `shared_space` in `contexts` and has any table of that kind
+must ship at least one such scenario, declaring both an `admin` and an `adult`,
+that shows what each may do. contract-ci fails without it.
+
+Two more contexts name a space's sub-kind:
+
+- `"shared_space.roster"`: a roster. A participant reaches only their own rows
+  and the steward's, and a `steward_writes_only` table refuses their writes.
+  The manifest must list `shared_space.roster`.
+- `"shared_space.coparenting"`: a co-parenting space. `inherit_visibility`
+  `adults_bypass` and `supervisor_assigns_owner` are off there, even for a
+  steward; declare two `admin` members for the two parents.
+
+`ui-scenarios.json` takes `"context": "shared_space"` and `"shared_space.roster"` too
+(one `admin`, the rest `adult`). Use it when the page decides what to offer from
+"is an adult": show that a participant is not offered what only the steward may do,
+and that the steward is.
+
 ## Demo mode
 
 When `DB` and `CONTEXT` are empty strings (local development or demo), the app should work with hardcoded demo data. Never crash or show an error when these are missing — show sample data instead.
