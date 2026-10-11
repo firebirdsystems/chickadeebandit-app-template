@@ -1332,6 +1332,11 @@ Two more contexts name a space's sub-kind:
 "is an adult": show that a participant is not offered what only the steward may do,
 and that the steward is.
 
+`preflight.sh` runs this app's `ui-scenarios.json` against the hub's local test stack when a hub
+checkout with Playwright sits beside the apps folder (about half a minute; `PREFLIGHT_SKIP_UI=1`
+skips it). No release workflow runs them for a single app, so this is where a stale scenario is
+caught.
+
 ## Demo mode
 
 When `DB` and `CONTEXT` are empty strings (local development or demo), the app should work with hardcoded demo data. Never crash or show an error when these are missing — show sample data instead.
