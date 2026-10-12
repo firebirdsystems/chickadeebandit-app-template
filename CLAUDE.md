@@ -36,9 +36,20 @@ async function db(sql, params = []) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sql, params }),
   });
-  return res.json(); // { rows: [...] }
+  // A refusal is a non-2xx status with `{ error }`; a proxy can answer 200 with
+  // a body that is not JSON at all. Both THROW, so the caller's catch runs.
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json || typeof json !== "object" || json.error) throw new Error(json?.error || "Couldn’t reach the hub. Try again.");
+  return json; // { rows: [...], changed }
 }
 ```
+
+**The helper must throw.** A helper that hands a failed answer back as data makes the page
+draw "nothing here" for "could not read", or show a write as done.
+`__tests__/request-helper.test.mjs` (shipped by the template, required in every app) runs each
+database helper against a 503, a 200 with `{ error }` and a non-JSON 200, and fails if any
+resolves. A write the hub narrows to nothing still answers 200 with `changed: 0`: check
+`changed` wherever the page would otherwise show success.
 
 Schema is managed by hub migrations in `migrations/001_init.sql` — do not run `CREATE TABLE` at runtime.
 
@@ -120,12 +131,49 @@ async function loadMembers() {
     members = [/* demo fallback */];
     return;
   }
-  try {
-    const res = await fetch(`${CONTEXT}?keys=family.members`);
-    members = ((await res.json())["family.members"]) ?? [];
-  } catch { members = []; }
+  const res = await fetch(`${CONTEXT}?keys=family.members`);
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json || typeof json !== "object" || json.error || json.$errors?.includes("family.members")) {
+    throw new Error("Couldn’t reach the hub. Try again.");
+  }
+  members = json["family.members"] ?? [];
 }
 ```
+
+Do not catch this into `members = []`. An empty member list is not a safe default: names go
+missing, pickers are empty, and every role check (`isAdult`, steward gates) is silently false.
+The hub can also answer **200** with a key it could not resolve left out and named in `$errors`;
+treat that as a failure. A key that is simply absent, with no `$errors` entry, means "not
+permitted / not installed" and is not one.
+
+## When the first load fails
+
+A read the page depends on that fails on first load is a failed load. It is never "empty" and
+never "not configured". The standard, which the hub's fault smoke (`npm run e2e:fault-smoke` in
+`packages/hub`) checks in every catalog app:
+
+```html
+<div class="load-error" data-testid="load-error" role="alert"><span>Couldn’t load the items.</span>
+  <button type="button" class="load-error-retry" data-testid="load-retry">Try again</button></div>
+```
+
+- A `loadFailed` flag, set when the first load fails and cleared when a load succeeds. While it
+  is set: the banner shows, the empty state does not, and controls that would write over data
+  the page could not read are hidden.
+- "Try again" re-runs the whole first load in place (members and settings included), not
+  `location.reload()`.
+- Nothing is left reading "Loading…", and nothing is thrown unhandled.
+- This covers the database reads, the member list (including the `$errors` shape) and any
+  settings row. A settings read that fails must not become "no group configured".
+- An OPTIONAL read (another app's export, an entitlement) does not raise the banner, but its
+  failure must not be shown as a fact either: say so inline or hide the claim.
+- Later background refreshes may fail quietly; a user-initiated one says so inline and keeps
+  what is on screen.
+
+The smoke opens the app five ways: database down (503), recovered, database answering 200 with
+a non-JSON body, member list down, and member list answered with `$errors`. `src/index.html`
+in this template is the reference implementation. Copy the two `.load-error` CSS rules as they
+are; the hub's theme test accepts those `var(--hub-…, fallback)` forms.
 
 ## Detected drives (`family.drives`)
 

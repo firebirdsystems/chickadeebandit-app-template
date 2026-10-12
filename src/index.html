@@ -75,6 +75,8 @@
     .empty, .loading { color: var(--muted); text-align: center; padding: 28px 16px; }
     .empty p { margin: 12px 0 0; }
     .error { background: var(--red-soft); color: var(--red); padding: 9px 12px; border-radius: 8px; margin-bottom: 10px; font-size: .86rem; }
+    .load-error { margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; background: var(--hub-tint-danger, #fee2e2); color: var(--hub-tint-danger-fg, #b91c1c); font-size: 0.9rem; display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+    .load-error-retry { background: none; border: 1px solid currentColor; border-radius: 8px; padding: 5px 10px; font: inherit; font-weight: 600; color: inherit; cursor: pointer; flex-shrink: 0; }
   </style>
   <base href="/run/app-template/">
 </head>
@@ -133,8 +135,16 @@ async function loadMembers() {
       { id: "demo-3", name: "Casey", role: "child" },
     ];
   } else {
+    // Throws like `db`: a failed read is never an empty household. The hub can
+    // also answer 200 with a key it could not resolve left out and named in
+    // `$errors` — that is a failure too. (A key that is simply absent, with no
+    // `$errors` entry, means "not permitted" and is not.)
     const res = await fetch(`${CONTEXT}?keys=family.members`);
-    members = ((await res.json())["family.members"]) ?? [];
+    const json = await res.json().catch(() => null);
+    if (!res.ok || !json || typeof json !== "object" || json.error || json.$errors?.includes("family.members")) {
+      throw new Error("Couldn’t reach the hub. Try again.");
+    }
+    members = json["family.members"] ?? [];
   }
   currentMember = HUB_MEMBER ?? members[0] ?? { id: "guest", name: "Guest", role: "adult" };
 }
@@ -158,15 +168,24 @@ async function loadItems() {
   items = rows;
 }
 
+// Set until a load has succeeded once. While it is, the page shows the banner
+// and nothing that claims to know the data: no empty state, no add form.
+let loadFailed = false;
+let loaded = false;
+
 async function refresh() {
   error = "";
   try {
     await Promise.all([loadMembers(), loadItems()]);
-    render();
+    loaded = true;
+    loadFailed = false;
   } catch (e) {
-    error = e.message;
-    render();
+    // A first load that fails is the banner; a later refresh that fails keeps
+    // what is on screen and says so inline.
+    if (loaded) error = e.message;
+    else loadFailed = true;
   }
+  render();
 }
 
 async function createItem(form) {
@@ -231,7 +250,8 @@ function render() {
       <button class="btn btn-ghost btn-sm" type="button" data-refresh>Refresh</button>
     </div>
     ${error ? `<div class="error">${esc(error)}</div>` : ""}
-    ${canManage() ? `
+    ${loadFailed ? `<div class="load-error" data-testid="load-error" role="alert"><span>Couldn’t load the items.</span> <button type="button" class="load-error-retry" data-testid="load-retry">Try again</button></div>` : ""}
+    ${loadFailed ? "" : canManage() ? `
       <form class="card form" id="create-form">
         <div class="field">
           <label for="title">Title</label>
@@ -249,7 +269,7 @@ function render() {
         <input id="search" class="search-input" type="search" placeholder="Search…" aria-label="Search" value="${esc(searchQ)}" />
       </div>` : ""}
     <section class="stack" id="list">
-      ${renderList()}
+      ${loadFailed ? "" : renderList()}
     </section>
   `;
 }
@@ -264,7 +284,7 @@ function renderList() {
 document.addEventListener("click", (event) => {
   const target = event.target.closest("button");
   if (!target) return;
-  if (target.matches("[data-refresh]")) { refresh(); return; }
+  if (target.matches("[data-refresh], [data-testid=load-retry]")) { refresh(); return; }
   if (target.hasAttribute("data-delete")) { deleteItem(target.getAttribute("data-delete")); return; }
 });
 
