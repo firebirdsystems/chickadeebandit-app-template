@@ -127,6 +127,13 @@ async function db(sql, params = []) {
   return json;
 }
 
+// What a failed write tells the user. `db` throws with the hub's own text
+// ("Database request failed (503)"), which is not wording for a person, so a
+// catch shows `e.message` only for an error this app worded itself and marked
+// with `userError`; anything else gets the fixed line the catch passes in.
+function userError(msg) { return Object.assign(new Error(msg), { forUser: true }); }
+function failText(e, line) { return e?.forUser ? e.message : line; }
+
 async function loadMembers() {
   if (!CONTEXT) {
     members = [
@@ -181,8 +188,9 @@ async function refresh() {
     loadFailed = false;
   } catch (e) {
     // A first load that fails is the banner; a later refresh that fails keeps
-    // what is on screen and says so inline.
-    if (loaded) error = e.message;
+    // what is on screen and says so inline, in the app's words.
+    console.error("refresh failed", e);
+    if (loaded) error = "Couldn’t refresh.";
     else loadFailed = true;
   }
   render();
@@ -206,7 +214,8 @@ async function createItem(form) {
     error = "";
     render();
   } catch (e) {
-    error = e.message;
+    console.error("create item failed", e);
+    error = failText(e, "Couldn’t add the item — try again.");
     render();
   }
 }
@@ -214,11 +223,16 @@ async function createItem(form) {
 async function deleteItem(id) {
   if (!canManage()) { error = "Only adults can delete items."; return render(); }
   try {
-    await db("DELETE FROM app_app_template__items WHERE id = ?", [id]);
+    const result = await db("DELETE FROM app_app_template__items WHERE id = ?", [id]);
+    // A write that matched nothing still answers 200, with `changed: 0`. That
+    // is the app's own news to give, so it is marked and shown as written.
+    if (DB && Number(result?.changed ?? 0) === 0) throw userError("That item was already deleted. Refresh to update the list.");
     items = items.filter(i => i.id !== id);
+    error = "";
     render();
   } catch (e) {
-    error = e.message;
+    console.error("delete item failed", e);
+    error = failText(e, "Couldn’t delete the item — try again.");
     render();
   }
 }

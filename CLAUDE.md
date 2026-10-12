@@ -175,6 +175,38 @@ a non-JSON body, member list down, and member list answered with `$errors`. `src
 in this template is the reference implementation. Copy the two `.load-error` CSS rules as they
 are; the hub's theme test accepts those `var(--hub-…, fallback)` forms.
 
+## When a write fails
+
+A write that fails for a generic reason shows one fixed line in the app's own words, naming the
+action: "Couldn’t add the item — try again." It never shows `e.message`. The request helper
+throws with the hub's text, which under an outage reads "Database request failed (503)".
+
+```js
+function userError(msg) { return Object.assign(new Error(msg), { forUser: true }); }
+function failText(e, line) { return e?.forUser ? e.message : line; }
+
+try {
+  const result = await db("DELETE FROM app_my_app__items WHERE id = ?", [id]);
+  if (Number(result?.changed ?? 0) === 0) throw userError("That item was already deleted.");
+} catch (e) {
+  console.error("delete item failed", e);
+  error = failText(e, "Couldn’t delete the item — try again.");
+}
+```
+
+- The hub's errors and the app's own both arrive as `e.message`. An error whose message the app
+  wrote for the user is marked `forUser` where it is thrown (`userError`); display code shows
+  `e.message` only for a marked error (`failText`). An unmarked app-worded throw is replaced by
+  the fixed line, so mark every one a catch can receive.
+- The real error goes to `console.error`, not to the screen. No `"Couldn’t save: " + e.message`,
+  no `e.message || "…"`.
+- The line goes to the surface that path already uses (inline line, toast, `hubAlert`), and the
+  form keeps what the user typed.
+- A hub refusal the user can act on (an upload too large, a plan limit, a named `e.code` the app
+  branches on) may keep its specific message in its own branch. Only the generic remainder gets
+  the fixed line.
+- A user-initiated refresh that fails says "Couldn’t refresh." and keeps what is on screen.
+
 ## Detected drives (`family.drives`)
 
 Drives recorded by the Chickadee Locate companion app are hub-native data, read
