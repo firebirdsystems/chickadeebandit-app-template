@@ -1363,12 +1363,20 @@ your app's own CI — no hub install needed — so a broken spec fails fast.
 }
 ```
 
-Step actions: `seedRaw` (policy-bypassing setup), `db`, `named`
+Step actions: `seedRaw` (policy-bypassing setup), `db`, `batch`
+(`{statements: [{sql, params?, requireChanges?}]}` — one transaction, as the
+page's own `{ statements }` request; use it for any write the page sends as a
+batch), `named`
 (`{kind, name}` ai_access SQL), `publish` (`{type, subject_id?, payload?}`),
 `store` (`{method, key?, value?}`), `context` (`{keys}`). `as` names a member
 from `members` (defaults to the first); `{{alias}}` interpolates that member's
 id into `params`/`value`. `expect` supports `status`, `rowCount`, `rowsContain`
-(subset match), and `errorIncludes`. The schema is `ScenariosFileSchema` in the
+(subset match), and `errorIncludes`; a `batch` step takes `status`,
+`errorIncludes` (an unmet `requireChanges` is `409`, "Stale state claim") and
+`changed` (the rows each statement affected, in order, e.g. `[1, 1]` — expect it
+whenever the point is that the writes landed, since a write the hub narrows to
+nothing still answers `200`), and no row expectations — read the rows back with
+a `db` step. A `batch` with no `expect` is setup and fails if the hub refuses it. The schema is `ScenariosFileSchema` in the
 hub's `@chickadee/hub-contract`. Reference examples: `tasks/scenarios.json`
 (private-visibility, and a shared-space pair) and
 `couples-bucket-list/scenarios.json` (couple scoping).
