@@ -1792,6 +1792,12 @@ Restricts who may write individual columns on `INSERT`/`UPDATE`:
     so the write only lands on the caller's own rows. Defaults to the policy's owner
     column; set `owner_column` to point at a different column (e.g. one participant's
     slot), which is how each party writes only its own agreement flag.
+  - `"adult_owner"` — the row owner, and only when they are an adult. The same
+    fail-closed guard as `"owner"`, reached only by an adult: a child writing their
+    own row is refused, and another adult's `UPDATE` matches no row. Use it for a
+    column only the row's own adult may change (`medication-tracker`'s `visibility`),
+    where `"adult"` would let any adult rewrite it and `"owner"` would let a child.
+    The hub refuses it beside `"adult"` or `"owner"`, which would make it dead.
 - **Empty `writable_by: []` forbids the write** — the column is immutable for that
   action (or endpoint-only, since trusted hub endpoints bypass row policies). Pair
   with `actions` to make a column *set-once* (`"actions": ["update"]` → writable on
@@ -4061,7 +4067,15 @@ still missing after a grace period.
 ```
 
 Required: `table`, `title_column`, `owner_column`, `times_column`, `completion`.
-`audience` is `owner` | `adults` | `everyone`. Consumes `cron`; basic nudges are
+`audience` is `owner` | `adults` | `everyone`. A lane's `member_column` holds a
+per-row JSON array of member ids that overrides the audience: blank means the
+audience, and an empty array (`[]`) means the lane is **off** for that row. Add
+`"empty_list": "audience"` to a lane whose list is only ever an override, so an
+empty array falls back to the audience instead (requires `enabled_column`, which
+is then the row's only off switch). Without it, a `prune_list` member
+reference that removes the last named member leaves `[]` and silently switches
+the reminder off. Leave it out where "nobody picked" is a choice the app offers
+(`medication-tracker`'s escalation list). Consumes `cron`; basic nudges are
 free within a household-wide monitored-item cap, **escalation is
 entitlement-gated**. One DO alarm is armed per household. Reference app:
 `medication-tracker`.
