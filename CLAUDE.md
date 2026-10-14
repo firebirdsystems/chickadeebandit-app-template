@@ -242,6 +242,22 @@ from the hub's text.
 - Apps inside a shared space: "You don’t have permission" stays true for a non-steward; do not
   name roles the viewer cannot see.
 
+#### Hub endpoints other than `/api/db`
+
+Agreements, slot claims, share links, partner pairing, invites, external contacts, documents
+and uploads follow the same table, and their text never reaches the screen either. Whatever
+wraps the call puts `status` (and the body's `code`, if any) on the Error it throws. The SDK's
+share and versioned-records helpers already do.
+
+- When the endpoint names the case (a `code`, or a status it gives for one reason only) and the
+  user can act on it, give a specific line in the app's own words. Examples: "That slot was just
+  taken." "This proposal was already answered." "That file is too large." "That kind of file
+  can’t be uploaded." "Too many share links are active — revoke one first."
+- Anything else uses the table. 403 gets the permission line; 404 is removed; 409 is changed by
+  someone else (the endpoint checked the state); 507 is storage full. 429 gets "Too many tries —
+  wait a minute and try again." No status, a 5xx or another 400 gets "Couldn’t {action} — try
+  again."
+
 ### Retry after a lost response
 
 A create can be stored while its answer is lost (a dropped connection, or the hub's 400 for a
@@ -251,14 +267,17 @@ write that timed out). Pressing Save again must not store it twice:
    every attempt; forget it when the form closes or the save succeeds.
 2. When the outcome is unknown — no status, a 400, or a 5xx other than 507 — read the row back by
    that id. Found: the first attempt landed; run the success path once (it could not have run).
+   A `UNIQUE_CONSTRAINT` answer is a 400 too: the usual retry of a create that landed collides on
+   its own pinned id, so read back by the id here as well before saying "already exists".
 3. If the form was edited since the first attempt, send the ordinary edit for the difference, or
    say "Saved as first entered — check it and update what changed." Never drop edits silently.
 4. Not found, or the read failed: the usual failure line; the id stays pinned.
 
 A guarded UPDATE (`… AND status = 'open'`) works the same with a pinned timestamp: on
 `changed: 0`, re-read; if the stored stamp is yours, it landed. Do not treat
-`UNIQUE_CONSTRAINT` as "already saved": another unique index, a cap or a write effect can produce
-the same answer for a real duplicate.
+`UNIQUE_CONSTRAINT` as "already saved" without that read: another unique index, a cap or a write
+effect can produce the same answer for a real duplicate. Only finding the row under the pinned id
+says it landed.
 
 ## Detected drives (`family.drives`)
 
