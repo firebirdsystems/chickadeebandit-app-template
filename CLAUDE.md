@@ -39,7 +39,11 @@ async function db(sql, params = []) {
   // A refusal is a non-2xx status with `{ error }`; a proxy can answer 200 with
   // a body that is not JSON at all. Both THROW, so the caller's catch runs.
   const json = await res.json().catch(() => null);
-  if (!res.ok || !json || typeof json !== "object" || json.error) throw new Error(json?.error || "Couldn’t reach the hub. Try again.");
+  // `status` and `code` ride on the error: the failure line depends on them
+  // (see "Refused, gone, or failed").
+  if (!res.ok || !json || typeof json !== "object" || json.error) {
+    throw Object.assign(new Error(json?.error || "Couldn’t reach the hub. Try again."), { status: res.status, code: json?.code });
+  }
   return json; // { rows: [...], changed }
 }
 ```
@@ -206,6 +210,55 @@ try {
   branches on) may keep its specific message in its own branch. Only the generic remainder gets
   the fixed line.
 - A user-initiated refresh that fails says "Couldn’t refresh." and keeps what is on screen.
+
+### Refused, gone, or failed: which line
+
+"Try again" is said only when trying again can work. A write the hub turned away, or one whose
+row is gone, says what happened instead; asking the user to retry a refusal sends them round in
+circles. Decide from the status and, for a write that changed nothing, from a re-read — never
+from the hub's text.
+
+| What happened | How the page knows | Line |
+|---|---|---|
+| Already there | `e.code === "UNIQUE_CONSTRAINT"` (keep `/UNIQUE constraint failed/i` on `e.message` as a fallback) | "That {thing} already exists." |
+| Not allowed | `e.status === 403` | "You don’t have permission to {action}." |
+| Storage full | `e.status === 507` | "The household’s storage is full — free up space first." |
+| Removed | 404, a batch's 409, or `changed: 0` — and a re-read finds no row | "This {thing} has been removed." |
+| Changed by someone else | 409 or `changed: 0` — and a re-read finds the row in another state | "This {thing} was changed by someone else — check it first." |
+| Refused quietly | `changed: 0` on an unguarded `WHERE id = ?` write, and a re-read finds the row (the row policy narrowed it) | "You don’t have permission to {action}." |
+| Unknown | `changed: 0` and the re-read itself failed | "Couldn’t {action} — try again." |
+| No answer, or the hub failed | no status, a 5xx other than 507, any other 400 | "Couldn’t {action} — try again." |
+
+- "Changed by someone else" is only for a GUARDED write (`… AND status = 'open'`, a pinned
+  stamp): there, a row still present means its state moved. On a plain `WHERE id = ?` nothing
+  can have "changed" — a row still present means the hub narrowed the write away from this
+  member, which is the permission line.
+- One small `failureLine(e, { action, thing })` per app picks the line; the removed/changed
+  split is the caller's, after its re-read (pass the result in, or throw a `userError`).
+- A 400 is ambiguous: the hub gives it for a write that timed out after it may have been stored
+  (see "retry after a lost response": re-read by the pinned id before showing anything).
+- An app's own specific refusal (a plan limit, an upload too large, a rule the page explains
+  better) keeps its own line; the table is the fallback, not a replacement.
+- Apps inside a shared space: "You don’t have permission" stays true for a non-steward; do not
+  name roles the viewer cannot see.
+
+### Retry after a lost response
+
+A create can be stored while its answer is lost (a dropped connection, or the hub's 400 for a
+write that timed out). Pressing Save again must not store it twice:
+
+1. Mint the new row's id once per form (on first Save, kept on the form) and send the same id on
+   every attempt; forget it when the form closes or the save succeeds.
+2. When the outcome is unknown — no status, a 400, or a 5xx other than 507 — read the row back by
+   that id. Found: the first attempt landed; run the success path once (it could not have run).
+3. If the form was edited since the first attempt, send the ordinary edit for the difference, or
+   say "Saved as first entered — check it and update what changed." Never drop edits silently.
+4. Not found, or the read failed: the usual failure line; the id stays pinned.
+
+A guarded UPDATE (`… AND status = 'open'`) works the same with a pinned timestamp: on
+`changed: 0`, re-read; if the stored stamp is yours, it landed. Do not treat
+`UNIQUE_CONSTRAINT` as "already saved": another unique index, a cap or a write effect can produce
+the same answer for a real duplicate.
 
 ## Detected drives (`family.drives`)
 
