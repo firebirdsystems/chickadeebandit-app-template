@@ -41,11 +41,11 @@ declaration. What still needs one is an operational value under a name the
 suffixes don't reach: `capacity`, `interval_hours`, `slot`, `days_mask`.
 
 Keys that impose this on at least one field include `row_policies` (owner,
-status, visibility, `retain_days.timestamp_column`, `file_id_column`,
-`exempt_when.column`, `visible_after_parent_column`), `slot_claims`,
+status, visibility, `visible_after_parent_column`), `retention`
+(`timestamp_column`, `file_id_column`, `exempt_when.column`), `slot_claims`,
 `secret_draw`, `inactivity_alerts`, `date_reminders`, `schedule_reminders`,
 `subscription_notify`, `shareable`, `geofence_zones`, `kiosk_quick_add`,
-`kiosk_checklist`, `delete_file_columns`, `update_file_columns`,
+`kiosk_checklist`, `file_columns`,
 `delete_cascades[].file_id_column`, and every column a `write_effects`
 statement computes.
 

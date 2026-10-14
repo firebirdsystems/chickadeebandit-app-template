@@ -5,16 +5,11 @@
   "version": "1.0.0",
   "description": "Minimal starting point for a Chickadee Bandit app: one governed table, a demo-mode fallback, and the standard build/dev tooling. Copy it, rename the id, and build from here.",
   "entrypoint": "index.html",
-  "runtime": "static",
   "category": "family",
   "tags": ["template", "starter"],
   "data_access": {
     "reads": ["family.members"],
     "writes": []
-  },
-  "permissions": {
-    "default_audience": "everyone",
-    "requires_approval": false
   },
   "storage": "db",
   "preload": {
@@ -29,8 +24,5 @@
     }
   },
   "nav": { "label": "Template" },
-  "resource_limits": {
-    "max_db_bytes": 52428800
-  },
   "icon": "🧩"
 }

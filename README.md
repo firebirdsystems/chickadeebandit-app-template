@@ -86,9 +86,10 @@ the hub you are installing into.
 | `version` | Semver string — **owned by CI, do not hand-edit** |
 | `description` | One-line description |
 | `entrypoint` | Entry file, almost always `index.html` |
-| `runtime` | `static` for HTML/JS apps (use this) |
 | `data_access` | `{ reads: [], writes: [] }` — family data keys (see below). Declare `[]` explicitly if none |
-| `permissions` | `{ default_audience, requires_approval }` — audience is `everyone` \| `adults` \| `children`; approval requires a hub admin to activate the app |
+| `runtime` | Optional. `static` is the only runtime and the default |
+| `storage` | `db` gives the app its own SQL tables (needs `migrations/`); `kv` a blob store. Omit if nothing is saved |
+| `permissions` | Optional. `{ default_audience, requires_approval }` — audience is `everyone` (default) \| `adults` \| `children`; approval requires a hub admin to activate the app |
 
 ### Key index — all 78 keys
 
@@ -138,10 +139,7 @@ the end of CLAUDE.md.
 
 | Key | Purpose |
 |---|---|
-| `delete_file_columns` | Scalar file-id columns reclaimed when the row is deleted. See "File lifecycle" |
-| `delete_file_list_columns` | The same, for JSON-array file-id columns |
-| `update_file_columns` | Scalar file-id columns reclaimed when an UPDATE unlinks them |
-| `update_file_list_columns` | The same, for JSON-array columns |
+| `file_columns` | `{ <table>: { columns, list_columns } }` — file-id columns reclaimed when the row is deleted or the column reassigned. See "File lifecycle" |
 | `file_purge` | Countersigned early destruction of a versioned record's bytes |
 | `delete_cascades` | Children (and their files) deleted with a parent row. See "Cascading deletes" |
 
@@ -227,7 +225,6 @@ Declare `resource_limits` even when accepting defaults, so limits are explicit:
   "max_store_bytes": 524288,         // kv apps: max KV storage (default 5 MB)
   "max_store_reads_per_day": 500,    // kv apps: read requests per day (default 1000)
   "max_store_writes_per_day": 200,   // kv apps: write requests per day (default 500)
-  "max_db_bytes": 52428800,          // db apps: database size cap (default 200 MB)
   "max_db_rows": 100000,             // db apps: total row cap
   "max_file_bytes": 10485760,        // file-uploading apps: max size per file (default 10 MB)
   "max_files_bytes": 524288000,      // file-uploading apps: total file storage (default 500 MB)

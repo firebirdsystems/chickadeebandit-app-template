@@ -923,37 +923,29 @@ file-lifecycle keys.** Do not reclaim from the client. A trailing
 `files.delete(id)` after the write is best-effort, unretried, and lost to a
 closed tab — the row is already gone, so nothing can name the leak afterwards.
 
-There are four keys, split along two axes — *what happened to the row* (deleted
-vs. updated) and *how the column stores ids* (one id vs. a JSON array):
-
-|  | scalar column (one id) | JSON-array column (many ids) |
-|---|---|---|
-| **row is DELETEd** | `delete_file_columns` | `delete_file_list_columns` |
-| **row survives, column reassigned** | `update_file_columns` | `update_file_list_columns` |
-
-All four are keyed by **unprefixed** table name and valued by an array of column
-names:
+One key, `file_columns`, keyed by **unprefixed** table name. Each table lists
+its scalar file-id columns under `columns` and its JSON-array columns under
+`list_columns` (either or both):
 
 ```jsonc
-"delete_file_columns":      { "items":  ["receipt_file_id"] },
-"delete_file_list_columns": { "plants": ["photo_file_ids"] },
-"update_file_columns":      { "gardens": ["plan_file_id"] },
-"update_file_list_columns": { "plants":  ["photo_file_ids"] }
+"file_columns": {
+  "items":   { "columns": ["receipt_file_id"] },
+  "gardens": { "columns": ["plan_file_id"] },
+  "plants":  { "list_columns": ["photo_file_ids"] }
+}
 ```
 
-A column usually needs **both** lanes. `plants.photo_file_ids` above appears in
-`delete_file_list_columns` *and* `update_file_list_columns`, because a gallery
-loses bytes two different ways: the plant is deleted, or one photo is removed
-from a plant that lives on. Declaring only the delete lane leaks every replaced
-avatar; declaring only the update lane leaks every deleted row.
+A declared column is reclaimed on **both** lanes — the row is deleted, or the
+column is reassigned on a row that lives on — because a gallery loses bytes both
+ways: the plant is deleted, or one photo is removed from a plant that survives.
+There is nothing to choose; declare the column once.
 
 **Scalar columns must be plaintext; list columns need not be.** The reclaim reads
 a scalar file column in raw SQL, before the household codec runs — so a column in
-`delete_file_columns` or `update_file_columns` must be named so it is never
-encrypted (an `_id` suffix does this; see "What is already plaintext") or listed
-in `db_plaintext_columns`. List columns are decoded *through* the codec and may
-be encrypted at rest. This is the only reason the two are separate keys rather
-than one.
+`columns` must be named so it is never encrypted (an `_id` suffix does this; see
+"What is already plaintext") or listed in `db_plaintext_columns`. List columns
+are decoded *through* the codec and may be encrypted at rest. This is the only
+reason the two lists are separate.
 
 **How it actually runs.** The engine reads the doomed ids out of the affected
 rows *before* the write, and puts a deletion intent into the **same transactional
@@ -971,7 +963,7 @@ and the hub treats all of them as one ownership graph:
 | Path | Key |
 |---|---|
 | a parent's children are cascade-deleted | `delete_cascades[].file_id_column` |
-| a row expires | `row_policies.<t>.retain_days.file_id_column` / `retention.<t>.file_id_column` |
+| a row expires | `retention.<t>.file_id_column` |
 | a member leaves the household | `member_references.<t>.file_id_column` / `.file_id_list_column` |
 
 Omitting a column from *any* of these is not a local mistake. The retention sweep
@@ -981,11 +973,10 @@ sweep can destroy an object a live row still points at.
 
 ### Checklist for any app that uploads files
 
-- [ ] Every file-id column appears in a delete lane (`delete_file_columns` or `delete_file_list_columns`), or is covered by `delete_cascades[].file_id_column` on its parent.
-- [ ] Every file-id column a user can *replace* also appears in the matching update lane.
+- [ ] Every file-id column appears in `file_columns` (`columns` or `list_columns`), or is covered by `delete_cascades[].file_id_column` on its parent.
 - [ ] Scalar file columns are plaintext (`_id` suffix, or `db_plaintext_columns`).
 - [ ] No `files.delete()` call in client code exists purely to clean up after a DB write. (Deleting a file the user explicitly removed *before* any row references it is fine.)
-- [ ] If rows expire or reference members, `retain_days.file_id_column` / `member_references.file_id_column` name the same columns.
+- [ ] If rows expire or reference members, `retention.<t>.file_id_column` / `member_references.file_id_column` name the same columns.
 
 ## File and document access control
 
@@ -1190,7 +1181,6 @@ The hub injects current limits into `window.__RESOURCE_LIMITS`:
 const LIMITS = window.__RESOURCE_LIMITS ?? {};
 // LIMITS.max_file_bytes      — max bytes per individual upload (default 10 MB)
 // LIMITS.max_files_bytes     — max total file storage for this app (default 500 MB)
-// LIMITS.max_db_bytes        — max DB storage for this app (default 200 MB)
 // LIMITS.max_store_bytes     — max KV storage for this app
 // LIMITS.max_store_reads_per_day
 // LIMITS.max_store_writes_per_day
@@ -1620,9 +1610,9 @@ same restrictions.
   setter, a valuation column visible only to adults.
 - `column_write_acls` is the write-side counterpart of `column_read_acls`:
   it restricts who may write individual columns on `INSERT`/`UPDATE`.
-- `retain_days` is a hub-managed **automatic expiry** modifier: the daily
-  maintenance runner deletes rows older than `default` days by `timestamp_column`.
-  App SQL never gets this power.
+- Expiry is not a policy modifier: declare it under the top-level `retention`
+  map (see "Hub-managed expiry"). The daily maintenance runner deletes rows
+  older than `default` days by `timestamp_column`; app SQL never gets this power.
 - `steward_writes_only` is a write-lock modifier available on any policy kind:
   `{ "kind": "adult_writable", "steward_writes_only": true }`. When the app is
   installed in a **`roster`** shared space (see “Shared spaces & the roster
@@ -1869,22 +1859,28 @@ Restricts who may write individual columns on `INSERT`/`UPDATE`:
 - A single `UPDATE` that writes two owner-columns bound to different owners is
   rejected — a member can only be one owner.
 
-#### `retain_days` — hub-managed automatic expiry (cross-kind modifier)
+#### Hub-managed automatic expiry — `retention.<table>` (top-level, any kind)
 
 Declares a retention window for one table; the hub's **daily maintenance runner**
 deletes rows whose `timestamp_column` is older than `default` days. App SQL is
 never granted this power — the bounded delete runs as trusted code, so a member
-cannot use it to purge rows early. Valid on any policy kind.
+cannot use it to purge rows early. It lives in the top-level `retention` map,
+keyed by unprefixed table, beside `row_policies` rather than inside a policy:
+whether a table is governed and whether it grows forever are independent
+questions. (Older bundles spelled this `row_policies.<t>.retain_days`; the hub
+lifts that into `retention` on read.)
 
 ```json
-"retain_days": {
-  "default": 90,
-  "timestamp_column": "created_at",
-  "id_column": "id",
-  "override_key": "messages",
-  "dependent_tables": [
-    { "table": "message_reactions", "foreign_key": "message_id" }
-  ]
+"retention": {
+  "messages": {
+    "default": 90,
+    "timestamp_column": "created_at",
+    "id_column": "id",
+    "override_key": "messages",
+    "dependent_tables": [
+      { "table": "message_reactions", "foreign_key": "message_id" }
+    ]
+  }
 }
 ```
 
@@ -2246,7 +2242,7 @@ rows and `sealed_until` for the final per-member responses.
 | Shared among an arbitrary set of named members (borrow request, expense split) | `party_scoped` |
 | Rows whose audience is a chat/forum channel's membership | `channel_scoped` |
 | Cap the total rows a table may hold (incl. external submissions) | any kind plus `max_rows` |
-| Auto-expire rows after N days (ephemeral logs, chat history, location pings) | any kind plus `retain_days` |
+| Auto-expire rows after N days (ephemeral logs, chat history, location pings) | any kind, plus a top-level `retention.<table>` entry |
 | Votes/comments/logs/check-offs whose visibility should match a parent record | `inherit_visibility` |
 | Turn-based child rows where only the current player may INSERT (moves, questions, guesses) | `inherit_visibility` with `insert_only_by_parent_column_member: "current_turn_member_id"` |
 | Attributed responses hidden from everyone except the owner until the parent closes | `sealed_until` with `visible_parent_status_values: ["closed"]`; usually add `max_per_member` and `frozen_when` |
@@ -3888,12 +3884,12 @@ Rules and gotchas:
 - **Prefer a real `ON DELETE CASCADE` FK** where your schema can declare one. `delete_cascades` is the retrofit path (and the file-reclaim path) for tables that cannot.
 - Declare `file_id_column` on any child that owns bytes, or the cascade deletes the rows and leaks their files.
 
-## Hub-managed expiry for ungoverned tables (`retention`)
+## Hub-managed expiry (`retention`)
 
-`row_policies.<table>.retain_days` gives a *governed* table an expiry. `retention`
-is the identical shape and the identical runner for a table that has **no row
-policy** — a pet's feeding log, a plant's watering log: correctly ungoverned
-because any member may write it, but still growing several rows a day forever.
+`retention` is the one place a table's expiry lives, governed or not. A pet's
+feeding log that any member may write is correctly ungoverned and still grows
+several rows a day forever; a governed chat table expires the same way. Keyed
+by unprefixed table:
 
 ```jsonc
 "retention": {
@@ -3901,12 +3897,11 @@ because any member may write it, but still growing several rows a day forever.
 }
 ```
 
-A table uses `retain_days` **or** `retention`, never both. Fields beyond
-`default` (max 3650) and `timestamp_column`: `id_column`, `override_key`,
-`tier` (`evidentiary` | `operational` | `transient`), `file_id_column`,
-`exempt_when: { column, values }`, `dependent_tables`, `fold`. See the
-`retain_days` section under "Row-level access control" for the full semantics —
-they are the same field.
+Fields beyond `default` (max 3650) and `timestamp_column`: `id_column`,
+`override_key`, `tier` (`evidentiary` | `operational` | `transient`),
+`file_id_column`, `exempt_when: { column, values }`, `dependent_tables`, `fold`.
+See "Hub-managed automatic expiry" under "Row-level access control" for the
+full semantics.
 
 ## Endpoint ACL keys
 

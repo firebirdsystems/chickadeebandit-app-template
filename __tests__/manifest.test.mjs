@@ -11,27 +11,27 @@ const VALID_AUDIENCES = ["everyone", "adults", "children"];
 
 describe("manifest.json", () => {
   it("has required string fields", () => {
-    for (const field of ["id", "name", "version", "description", "entrypoint", "runtime", "icon"]) {
+    for (const field of ["id", "name", "version", "description", "entrypoint", "icon"]) {
       expect(manifest[field], `missing field: ${field}`).toBeTruthy();
     }
   });
 
   it("entrypoint is index.html", () => expect(manifest.entrypoint).toBe("index.html"));
-  it("runtime is static",        () => expect(manifest.runtime).toBe("static"));
+  // runtime and permissions are optional: omitted they mean "static" and
+  // everyone-without-approval. storage omitted means nothing is saved. When
+  // present they must be valid.
+  it("runtime, if declared, is static", () => expect(manifest.runtime ?? "static").toBe("static"));
 
-  it("storage is declared and valid", () => {
-    expect(manifest.storage, "storage field is required").toBeTruthy();
-    expect(VALID_STORAGE).toContain(manifest.storage);
+  it("storage, if declared, is valid", () => {
+    if (manifest.storage !== undefined) expect(VALID_STORAGE).toContain(manifest.storage);
   });
 
   it("version follows semver", () => expect(manifest.version).toMatch(/^\d+\.\d+\.\d+$/));
 
-  it("permissions.default_audience is valid", () => {
-    expect(VALID_AUDIENCES).toContain(manifest.permissions.default_audience);
-  });
-
-  it("permissions.requires_approval is boolean", () => {
-    expect(typeof manifest.permissions.requires_approval).toBe("boolean");
+  it("permissions, if declared, are valid", () => {
+    const permissions = manifest.permissions ?? { default_audience: "everyone", requires_approval: false };
+    expect(VALID_AUDIENCES).toContain(permissions.default_audience);
+    expect(typeof permissions.requires_approval).toBe("boolean");
   });
 
   it("data_access has reads and writes arrays", () => {
