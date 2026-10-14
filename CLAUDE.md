@@ -2909,7 +2909,7 @@ Rules worth knowing:
 - **Never over visitor-written rows.** A calendar may not read a table any item type's `submit` form writes, and an `sql` source may not read the clock (`date('now')`, `CURRENT_DATE`): the window is the household's day, SQLite's is UTC.
 - **`:item_id` is a guard, not a proof.** Row policies do not apply to share reads, so a query that is not really scoped to the item publishes every item's schedule behind every link. Pin the query in `shareable.test.mjs`.
 - **Times are household-local.** When the household has a time zone the feed converts each event to UTC, so a subscriber in another zone sees the right moment; without one the times are floating.
-- **A password-protected link serves no feed** (a calendar app cannot answer a prompt). The mint and list replies carry `calendarUrl` only when the link has a feed; `share.calendarUrl(link)` from `/hub-sdk.js` turns it into a `webcal://` subscribe link. Pass it to `src/share.js` as `calendarUrl`, and offer `SHARE_CALENDAR_EXPIRY_CHOICES` (up to a year) instead of `SHARE_EXPIRY_CHOICES` — a subscription stops updating when its link expires.
+- **A password-protected link serves no feed** (a calendar app cannot answer a prompt). The mint and list replies carry `calendarUrl` only when the link has a feed; `share.calendarUrl(link)` from `/hub-sdk.js` turns it into a `webcal://` subscribe link. Pass it to the share panel (`createShareUi` from `/hub-share-ui.js`, the hub-served panel every app with share links imports — never a local copy) as `calendarUrl`, and offer `SHARE_CALENDAR_EXPIRY_CHOICES` (up to a year) instead of `SHARE_EXPIRY_CHOICES` — a subscription stops updating when its link expires.
 - **Close the item when it leaves the app.** If archiving hides a row from your UI, gate the item with `visible_where` on the archive flag: otherwise the page and the feed outlive the panel that could revoke them.
 - **Revocation is not instant for a subscriber.** Calendar providers cache the feed for hours; the shared panel says so.
 
@@ -2920,7 +2920,7 @@ For immutable history rows, receipts, predictions, audit notes, and other "add a
 The hub exposes `POST /run/{appId}/api/append-record/{name}` and injects `window.__APPEND_RECORD_URL` when the app declares the manifest field. The endpoint:
 
 - accepts only whitelisted columns
-- derives the row id, writer member id, and timestamp server-side
+- derives the row id, writer member id, and timestamp server-side — except that the body may carry the id column (`id` unless `id_column` says otherwise) as a UUID. Send one, minted once per form, so a retry after a lost answer finds the record its first try stored: a repeat by the same member answers `200` with the stored record (even if that first try closed the parent); an id stored by anyone else answers `409` `code: "record_id_taken"`. Tables with no `writer_column` treat any stored id as taken.
 - optionally verifies a parent row exists
 - optionally blocks appends when the parent is in a closed status
 - enforces string length and enum allowlists
