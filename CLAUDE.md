@@ -1475,7 +1475,9 @@ Two more contexts name a space's sub-kind:
   The manifest must list `shared_space.roster`.
 - `"shared_space.coparenting"`: a co-parenting space. `inherit_visibility`
   `adults_bypass` and `supervisor_assigns_owner` are off there, even for a
-  steward; declare two `admin` members for the two parents.
+  steward, unless the table declares `coparenting_child_supervision`, which
+  turns them back on for rows owned by a child member only; declare two
+  `admin` members for the two parents.
 
 `ui-scenarios.json` takes `"context": "shared_space"` and `"shared_space.roster"` too
 (one `admin`, the rest `adult`). Use it when the page decides what to offer from
@@ -1991,12 +1993,33 @@ a transaction against another member's bank by guessing its id.
 - Add `"supervisor_assigns_owner": true` when an adult records rows **for** a
   member (a parent ticking a chore for a login-less kid, creating a child's
   savings goal): a supervisor's INSERT then keeps the `member_column` value the
-  app supplied. Supervisor means a household adult or a roster steward — never a
-  coparenting/general-space steward, who is still stamped. Everyone else is
-  still stamped, and a blank owner falls back to the caller. Cannot be combined
-  with `write_owner_only`. A supervisor's `ON CONFLICT … DO UPDATE` on such a
-  table is refused (the conflict key no longer proves the row is theirs).
+  app supplied. Supervisor means a household adult, or the steward of a roster
+  or general space — never a co-parenting steward, who is still stamped (see
+  the next item). Everyone else is still stamped, and a blank owner falls back
+  to the caller. Cannot be combined with `write_owner_only`. A supervisor's
+  `ON CONFLICT … DO UPDATE` on such a table is refused (the conflict key no
+  longer proves the row is theirs).
   References: chores `completions`, nest-egg `savings_goals`.
+- Add `"coparenting_child_supervision": true` (with `supervisor_assigns_owner`)
+  when parents in a **co-parenting space** must create rows for a child (a
+  child's health card, a medication). There, a steward's INSERT keeps the
+  supplied `member_column` only when every supplied owner is a current
+  **child** member of the space. A row named for the other parent, a guest, or
+  anyone else is still stamped with the caller, so one co-parent can never
+  create rows owned by the other. It has no effect in a household, roster or
+  general space. The validator refuses it without `supervisor_assigns_owner: true`
+  and without `column_write_acls` locking `member_column` as exactly
+  `{ "writable_by": [], "actions": ["update"] }`. That lock binds member SQL
+  only, so the hub's own write lanes may not touch `member_column` either (nor
+  `id`, when an opted-in `inherit_visibility` child hangs off this table): no
+  `write_effects` statement may INSERT or UPDATE it, and an effect on this
+  table must be a plain `INSERT INTO t (cols) VALUES …` or `UPDATE t SET col = …`
+  (no upsert, REPLACE, `INSERT … SELECT` or column-less INSERT); no
+  `automation_actions` step may insert, set, upsert or increment it; no
+  `shareable` submit field or `values_from.copy` target may name it; and the
+  table may not be an `agreements`, `partner_link`, `mutual_signals`,
+  `mutual_reveal`, `paired_messages` or `couple_item_state` table.
+  References: health-cards `health_profiles`, medication-tracker `medications`.
 - Add `"insert_privileged_only": true` (requires a `privileged_groups` entry covering `"insert"`) to block `INSERT` for everyone except the privileged group — returns 403 for all other callers regardless of adult status. The column is still forced to the caller for privileged inserts. SELECT/UPDATE/DELETE are unaffected by this flag.
 - Add `"write_visibility_scoped": true` for **writes that follow reads**: a
   caller may `UPDATE`/`DELETE` exactly the rows they can `SEE` (their own, plus
@@ -2156,10 +2179,57 @@ they reference via foreign key:
   deliberate, not an inconsistency to tidy up: writer-only is what every app
   written before this flag relies on, so the default had to be the one that
   changes nothing. It never widens *which parents* a caller can reach — the
-  parent-visibility check still applies — and it has no effect in a coparenting
-  space (both parents are stewards there) or, for now, a general space. Leave it
-  off where writer-only is the guarantee your app advertises: sealed responses,
-  attributed votes, per-member logs.
+  parent-visibility check still applies — and it has no effect in a co-parenting
+  space (both parents are stewards there) unless the table also declares
+  `coparenting_child_supervision`; in a general space it follows the steward.
+  Leave it off where writer-only is the guarantee your app advertises: sealed
+  responses, attributed votes, per-member logs.
+- Add `"coparenting_child_supervision": true` (with `"adults_bypass": true`) to
+  let a steward in a **co-parenting space** `UPDATE`/`DELETE` child rows another
+  member wrote, but only under a parent row whose owner (the parent policy's
+  `member_column`) is a current **child** member, such as entries on a child's
+  card. Rows under a parent owned by an adult (the other parent) or a guest stay
+  writer-only, and a space with no children grants nothing. It has no effect
+  outside co-parenting spaces, and the validator refuses it without
+  `adults_bypass: true`. It also requires an `owner_or_visibility` parent whose
+  `member_column` and `id` are locked with `column_write_acls` exactly
+  `{ "writable_by": [], "actions": ["update"] }` (the same lock on this table's
+  `writer_column`), and a parent `delete_cascades` entry listing this table by
+  `fk_column` (its `member_references` `on_removed: "delete"` and `retention`
+  must list it too, when declared). The parent table itself must not be a
+  dependent in any other table's `delete_cascades`, `member_references`
+  `dependent_tables` or `retention` `dependent_tables`: those lanes delete only
+  their direct dependents, so the cards would go and their entries would stay
+  behind for a re-created card to adopt. The one exception is a nested
+  `retention` level for the parent that itself lists this table. Delete the
+  parent with its own statement instead. Those locks bind member SQL only, so
+  the hub's own write lanes may not write the locked columns at all: the
+  parent's `member_column` and `id`, and this table's `writer_column` and
+  `fk_column`. No `write_effects` statement may INSERT or UPDATE them, and an
+  effect on either table must be a plain `INSERT INTO t (cols) VALUES …` or
+  `UPDATE t SET col = …` (no upsert, REPLACE, `INSERT … SELECT` or column-less
+  INSERT). No `automation_actions` step may insert, set, upsert or increment
+  them. No `shareable` submit field or `values_from.copy` target may name them
+  (the submit's own `fk_column`, bound to the shared row, is fine). Neither
+  table may be an `agreements`, `partner_link`, `mutual_signals`,
+  `mutual_reveal`, `paired_messages` or `couple_item_state` table, and this
+  table may not set `endpoint_writes_only`. Compute those values in the
+  member's own write instead.
+- Add `"delete_adult_only": true` to refuse `DELETE` from anyone who is not an
+  adult member ("DELETE from table … requires an adult member"). It applies
+  even to privileged-group members, unlike `owner_or_visibility`'s, which a
+  member privileged for `"delete"` skips. `UPDATE` is unaffected. Use it when a
+  child is credited as a row's writer (a backfill, or rows a child may add) but
+  must not remove it. It binds this table's own `DELETE` only, so every
+  `delete_cascades` parent that lists this table, and every table with a
+  `write_effects` delete effect that removes these rows, must itself refuse
+  deletes to non-adults: `delete_adult_only` with no `privileged_groups` entry
+  covering `"delete"` (an entry with no `actions` covers it, as does
+  `bypass_group_setting`; `"actions": ["select"]` does not), or
+  `endpoint_writes_only`, or an `adult_only` / `adult_writable` /
+  `endpoint_only` policy. An insert effect that removes these rows needs every
+  write of its table adult-only: `endpoint_writes_only`, or an `adult_only` /
+  `adult_writable` / `endpoint_only` policy.
 - Add `"insert_privileged_only": true` to block `INSERT` for everyone except
   the privileged group inherited from the parent policy's `privileged_groups`
   (entries covering `"insert"`). Returns 403 for all other callers. Useful when
