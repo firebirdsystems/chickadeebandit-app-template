@@ -2925,6 +2925,7 @@ The hub exposes `POST /run/{appId}/api/append-record/{name}` and injects `window
 - optionally blocks appends when the parent is in a closed status
 - enforces string length and enum allowlists
 - inserts while bypassing the table's `endpoint_only` write block
+- takes several records of one kind at once as `{ "rows": [ {…}, {…} ] }` (1–20): each row is held to exactly the rules above, and they are stored in one transaction — all or none. Use it whenever one action writes several rows (an account given for each child, an answer to each): separate appends can stop part way and leave a half-written account the journal can never remove. The answer is `{ success, rows: [{ id, created_at }] }` in the order sent. Pin one id per row, minted once per action: a retry answers `200` as stored when every row is the caller's, and `409` `code: "record_batch_partial"` if only some ids are stored.
 
 Pair each append-only target table with either `row_policies.{table}.kind = "endpoint_only"` or an existing read policy that supports `"endpoint_writes_only": true` so direct app SQL cannot `INSERT`, `UPDATE`, or `DELETE` rows. Use `endpoint_only` for household-readable logs; use `endpoint_writes_only` on policies like `owner_only`, `adult_writable`, or `inherit_visibility` when reads still need owner/private/inherited filtering.
 
