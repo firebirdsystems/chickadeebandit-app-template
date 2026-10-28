@@ -5,7 +5,7 @@
 -- Migrations are additive only: add 002_*.sql, 003_*.sql for later changes.
 -- Never DROP/RENAME; the runner applies each version exactly once, in order.
 CREATE TABLE IF NOT EXISTS app_app_template__items (
-  id         TEXT PRIMARY KEY,
+  id         TEXT NOT NULL PRIMARY KEY,
   title      TEXT NOT NULL,
   note       TEXT NOT NULL DEFAULT '',
   created_by TEXT NOT NULL,          -- member id of the author (plaintext: ends in _by)

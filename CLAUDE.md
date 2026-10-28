@@ -2538,7 +2538,7 @@ Release deletes only the caller's own claim. Swap claims the destination slot fi
 
 ```sql
 CREATE TABLE IF NOT EXISTS app_myapp__slots (
-  id         TEXT PRIMARY KEY,
+  id         TEXT NOT NULL PRIMARY KEY,
   title      TEXT NOT NULL,
   capacity   INTEGER NOT NULL CHECK (capacity >= 0),
   status     TEXT NOT NULL DEFAULT 'open',
@@ -2547,7 +2547,7 @@ CREATE TABLE IF NOT EXISTS app_myapp__slots (
 );
 
 CREATE TABLE IF NOT EXISTS app_myapp__slot_claims (
-  id         TEXT PRIMARY KEY,
+  id         TEXT NOT NULL PRIMARY KEY,
   slot_id    TEXT NOT NULL,
   member_id  TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -2772,7 +2772,7 @@ Split into two tables — item details in a `party_scoped` table, agreement stat
 ```sql
 -- Item details: parties can read/edit terms
 CREATE TABLE IF NOT EXISTS app_myapp__requests (
-  id          TEXT PRIMARY KEY,
+  id          TEXT NOT NULL PRIMARY KEY,
   borrower_id TEXT NOT NULL,
   lender_id   TEXT NOT NULL,
   item_name   TEXT NOT NULL,
@@ -2784,7 +2784,7 @@ CREATE TABLE IF NOT EXISTS app_myapp__requests (
 
 -- Agreement state: only api/agree may write
 CREATE TABLE IF NOT EXISTS app_myapp__request_agreements (
-  id              TEXT PRIMARY KEY,  -- same id as requests
+  id              TEXT NOT NULL PRIMARY KEY,  -- same id as requests
   borrower_id     TEXT NOT NULL,     -- copied from requests on init
   lender_id       TEXT NOT NULL,
   borrower_agreed INTEGER NOT NULL DEFAULT 0,
